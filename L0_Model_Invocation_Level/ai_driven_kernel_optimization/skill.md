@@ -1,0 +1,79 @@
+---
+skill_name: AI-Driven Flash Attention Kernel Optimization
+description: Survey of LLM/RL-driven approaches to automatically generate and optimize Flash Attention CUDA/Triton kernels, achieving up to 35x speedup over manual implementations
+level: L0 - Model/Invocation Level
+target_hardware: NVIDIA GPUs (all), AMD GPUs (via Triton/ROCm)
+relevance: When exploring automated approaches to generate or optimize Flash Attention kernels instead of manual tuning
+---
+
+# AI-Driven Flash Attention Kernel Optimization
+
+## What It Is
+A growing field of research uses LLMs and reinforcement learning to automatically generate, optimize, and tune GPU kernels — including Flash Attention implementations. Key systems include QiMeng-Attention (surpasses cuDNN and official FA on diverse GPUs), GEAK (AMD's AI agent for Triton/HIP kernel optimization), AutoTriton (RL-based Triton code generation), and CUDA-L2 (RL-driven GEMM outperforming cuBLAS by 19%).
+
+## Key Approaches
+
+### QiMeng-Attention (Most Directly Relevant)
+- Uses an LLM-friendly "Thinking Language" (LLM-TL) to enable LLMs to generate FlashAttention implementations
+- Achieves up to 35.16x speedup over naive attention
+- Surpasses human-optimized libraries (cuDNN, official FlashAttention) in most scenarios
+- Works across diverse GPU architectures without manual reimplementation
+
+### GEAK (AMD's AI Kernel Agent)
+- Multi-agent framework: OptimAgent + OpenEvolve for HIP kernel optimization
+- v3: Repository-level autonomous optimization with profiling-driven strategy
+- Knowledge retrieval with hybrid semantic+BM25+reranking using AMD/NVIDIA knowledge bases
+- Triton and HIP kernel generation for AMD GPUs
+
+### AutoTriton / TritonRL / TritonForge
+- AutoTriton: LLM + RL (GRPO) for automated Triton code generation; 8B model matches Claude-4-Sonnet
+- TritonRL: Domain-specialized 8B LLM for Triton with hierarchical reward decomposition
+- TritonForge: Profiling-guided iterative Triton optimization, up to 5x gains
+
+### CUDA-L2 (RL-Driven GEMM)
+- RL-optimized HGEMM surpasses cuBLAS by +19.2% and cuBLASLt by +11.4%
+- Directly applicable to the GEMM components within Flash Attention
+
+### SwizzlePerf
+- LLM-driven memory access pattern optimization (swizzling)
+- 5 minutes of AI time replaces 2 weeks of engineer effort for GEMM kernels
+- Up to 2.06x speedup via optimized memory access patterns
+
+### FlagAttention
+- Triton-based attention operators from the awesome-LLM-driven-kernel-generation maintainers
+- Portable across GPU architectures via Triton
+- Includes flash attention, linear attention, and chunked attention variants
+
+### ThunderKittens (Hazy Research)
+- Tile-based CUDA abstraction from the Flash Attention research group at Stanford
+- 4 core abstractions: register tiles, shared tiles, register vectors, shared vectors
+- Designed to make writing attention-class kernels ergonomic while achieving near-peak performance
+- Achieved #1 on H100 attention benchmarks at release
+
+## When to Use
+- Exploring automated optimization as an alternative to manual kernel tuning
+- Need to port Flash Attention to a new GPU architecture quickly
+- Prototyping attention variants where manual CUDA optimization is too costly
+- Evaluating whether AI-generated kernels can match or exceed hand-tuned implementations
+
+## When NOT to Use
+- Already have well-tuned FA kernels for the target hardware (use existing implementations)
+- Need guaranteed correctness for production deployment (validate AI-generated kernels thoroughly)
+- Target hardware has mature FA libraries (e.g., H100 with official FA3)
+
+## Key Takeaways
+- AI-driven kernel generation is reaching parity with and sometimes exceeding hand-tuned Flash Attention implementations
+- QiMeng-Attention demonstrates that LLMs can generate FA kernels surpassing cuDNN on diverse GPUs
+- The field is converging on LLM + RL + hardware profiling as the core optimization loop
+- Triton is emerging as the preferred target language for AI-generated kernels (portable, Python-like, auto-tunable)
+- ThunderKittens from the Flash Attention group provides a middle ground: human-designed tile abstractions that make kernel writing more systematic
+
+## References
+- [Towards Automated Kernel Generation in the Era of LLMs (Survey, arXiv 2601.15727)](https://arxiv.org/abs/2601.15727)
+- [QiMeng-Attention (ACL 2025)](https://aclanthology.org/2025.findings-acl.446/)
+- [GEAK: Triton Kernel AI Agent (arXiv 2507.23194)](https://arxiv.org/abs/2507.23194)
+- [AutoTriton (arXiv 2507.05687)](https://arxiv.org/abs/2507.05687)
+- [CUDA-L2: Surpassing cuBLAS (arXiv 2512.02551)](https://arxiv.org/abs/2512.02551)
+- [ThunderKittens (Hazy Research)](https://github.com/HazyResearch/ThunderKittens)
+- [FlagAttention (Triton attention operators)](https://github.com/flagos-ai/FlagAttention)
+- [awesome-LLM-driven-kernel-generation](https://github.com/flagos-ai/awesome-LLM-driven-kernel-generation)
