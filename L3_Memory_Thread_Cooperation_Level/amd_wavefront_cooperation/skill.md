@@ -103,6 +103,148 @@ MI300X has 8 XCDs (chiplets), each with its own L2 cache:
 - Using high-level APIs (PyTorch SDPA, Composable Kernel API) that abstract these details
 - Writing non-performance-critical GPU code where synchronization overhead is negligible
 
+## Source Code Examples
+
+### Wave-64 Thread Identification
+
+```cpp
+constexpr int WAVE_SIZE = 64;
+__device__ int laneid() { return threadIdx.x & 0x3F; }  // Mask with 63
+__device__ int waveid() { return threadIdx.x >> 6; }    // Divide by 64
+```
+
+### Butterfly Reduction for Softmax Max (wave_reduce_max)
+
+```cpp
+// Max reduction across wave (for softmax numerical stability)
+__device__ inline float wave_reduce_max(float value) {
+    float result = value;
+    for (int offset = 32; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(result, offset, 64);
+        result = fmaxf(result, other);
+    }
+    return result;  // All 64 lanes have the same max
+}
+
+// Sum reduction across wave (for softmax normalization)
+__device__ inline float wave_reduce_sum(float value) {
+    float result = value;
+    for (int offset = 32; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(result, offset, 64);
+        result += other;
+    }
+    return result;  // All 64 lanes have the same sum
+}
+```
+
+### Multi-Wave Softmax Reduction with LDS
+
+```cpp
+__global__ void multi_wave_softmax_reduction(const float* input, float* output, int N) {
+    __shared__ float wave_results[BLOCK_SIZE / 64];  // One slot per wavefront
+
+    int lane = threadIdx.x % 64;
+    int waveId = threadIdx.x / 64;
+
+    // Step 1: Load and reduce within wavefront
+    float val = input[blockIdx.x * blockDim.x + threadIdx.x];
+    val = wave_reduce_max(val);
+
+    // Step 2: First lane writes wavefront result to LDS
+    if (lane == 0) {
+        wave_results[waveId] = val;
+    }
+    __syncthreads();
+
+    // Step 3: First wavefront reduces across all wavefronts
+    if (waveId == 0) {
+        val = (lane < blockDim.x / 64) ? wave_results[lane] : -INFINITY;
+        val = wave_reduce_max(val);
+        if (lane == 0) {
+            output[blockIdx.x] = val;
+        }
+    }
+}
+```
+
+### Bank Conflict Swizzling for 16x16 BF16 Tiles
+
+```cpp
+__device__ inline uint32_t swizzle_16x16_bf16(int row, int col) {
+    // XOR swizzle to distribute across 32 banks
+    int row_swizzle = row ^ ((col >> 2) & 0x7);
+    return (row_swizzle * 16 + col) * sizeof(__hip_bfloat16);
+}
+```
+
+### Direct Buffer-to-LDS Transfers with Readfirstlane Hoisting
+
+```cpp
+// Hoist: compute ONCE before loop
+uint32_t lds_base = __builtin_amdgcn_readfirstlane(
+    static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&shared_buffers[0][0]))
+);
+
+// Main loop: no repeated readfirstlane
+for (int i = 0; i < num_tiles; ++i) {
+    llvm_amdgcn_raw_buffer_load_lds(
+        buf_rsrc, (lds_ptr_t)lds_base, 16,
+        i * tile_stride, 0, 0, 0
+    );
+}
+```
+
+### Ping-Pong Buffering Pattern
+
+```cpp
+__global__ void ping_pong_attention() {
+    __shared__ float K[2][TILE_N][HEAD_DIM];  // Double buffer for K tiles
+    __shared__ float V[2][TILE_N][HEAD_DIM];  // Double buffer for V tiles
+
+    int tic = 0, toc = 1;
+
+    // Prologue: load first K/V tile
+    load_kv_tile(K[tic], V[tic], /*iter=*/0);
+    __builtin_amdgcn_s_barrier();
+
+    // Main loop
+    for (int k = 0; k < num_kv_blocks - 1; ++k) {
+        // Async load next tile
+        load_kv_tile(K[toc], V[toc], k+1);
+
+        // Compute S = Q * K^T on current tile
+        compute_qk(Q_reg, K[tic], S_acc);
+
+        // Softmax
+        softmax_update(S_acc, m_prev, l_prev);
+
+        // Compute O += P * V on current tile
+        compute_pv(P_reg, V[tic], O_acc);
+
+        // Swap buffers
+        tic ^= 1; toc ^= 1;
+        __builtin_amdgcn_s_barrier();
+    }
+
+    // Epilogue: process last tile
+    compute_qk(Q_reg, K[tic], S_acc);
+    softmax_update(S_acc, m_prev, l_prev);
+    compute_pv(P_reg, V[tic], O_acc);
+}
+```
+
+### Chiplet-Aware Scheduling
+
+```cpp
+__device__ inline int chiplet_transform(int wgid, int num_wgs, int num_xcds) {
+    int xcd_id = wgid % num_xcds;
+    int local_wg = wgid / num_xcds;
+    return xcd_id * (num_wgs / num_xcds) + local_wg;
+}
+```
+
+This ensures that workgroups processing adjacent Q tiles are scheduled on the same XCD, maximizing L2 cache reuse for shared K/V tiles.
+
 ## Key Takeaways
 - The Wave-64 model fundamentally changes reduction patterns: 6 steps instead of 5, affecting softmax latency
 - Phase-aware scheduling barriers (`sched_group_barrier`) are the primary tool for MFMA pipeline optimization on AMD

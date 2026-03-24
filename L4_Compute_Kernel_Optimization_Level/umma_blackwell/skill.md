@@ -119,6 +119,88 @@ P (softmax output) reuses S columns with offset:
 - For non-MMA operations (element-wise, reductions) that do not use tensor cores
 - When kernel complexity is not justified (e.g., short sequences where cuDNN or torch SDPA suffice)
 
+## Source Code Examples
+
+### 32-Bit Descriptor Construction (Python)
+
+From the FA4 codebase (`mma_sm100_desc.py`), this function builds the packed 32-bit instruction descriptor for Blackwell MMA:
+
+```python
+def make_instr_desc(
+    a_type, b_type, c_type,
+    M: int, N: int,
+    a_major: Major, b_major: Major,
+    a_neg=ScaleIn.One, b_neg=ScaleIn.One,
+    c_sat=Saturate.False_,
+    is_sparse=False,
+    max_shift=MaxShift.NoShift,
+) -> int:
+    """Build the 32-bit instruction descriptor for Blackwell MMA."""
+    a_fmt = int(to_UMMA_format(a_type))
+    b_fmt = int(to_UMMA_format(b_type))
+    c_fmt = int(to_C_format(c_type))
+
+    # Range checks
+    assert M in (64, 128, 256), "M must be 64, 128 or 256"
+    assert 8 <= N <= 256 and (N & 7) == 0, "N must be 8..256, multiple of 8"
+
+    m_dim = M >> 4   # 5-bit field
+    n_dim = N >> 3   # 6-bit field
+
+    # Pack bit-fields
+    desc = 0
+    desc |= (int(is_sparse)  & 0x1) << 2
+    desc |= (int(c_sat)      & 0x1) << 3
+    desc |= (c_fmt           & 0x3) << 4
+    desc |= (a_fmt           & 0x7) << 7
+    desc |= (b_fmt           & 0x7) << 10
+    desc |= (int(a_neg)      & 0x1) << 13
+    desc |= (int(b_neg)      & 0x1) << 14
+    desc |= (int(a_major)    & 0x1) << 15
+    desc |= (int(b_major)    & 0x1) << 16
+    desc |= (n_dim           & 0x3F) << 17
+    desc |= (m_dim           & 0x1F) << 24
+    desc |= (int(max_shift)  & 0x3) << 30
+
+    return desc & 0xFFFF_FFFF
+```
+
+### TMEM Column Allocation Example
+
+FA4 partitions the 512 TMEM columns across attention computation stages. The column layout is configured in the kernel constructor:
+
+```python
+self.tmem_s_offset = [0, self.n_block_size]                    # e.g., [0, 128]
+self.tmem_o_offset = [
+    self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
+    for i in range(self.q_stage)
+]                                                               # e.g., [256, 384]
+self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded  # e.g., 512
+assert self.tmem_total <= self.tmem_alloc_cols                  # Must fit in 512 cols
+```
+
+### CTA-Group Configuration Example
+
+CTA-group::2 (cooperative two-CTA) mode doubles the effective M dimension per instruction:
+
+```python
+cta_group = tcgen05.CtaGroup.TWO
+cluster_shape_mn = (2, 1)
+# MMA tiler M covers BOTH CTAs
+mma_tiler_qk = (2 * m_block_size, n_block_size, head_dim)  # e.g., (256, 128, 128)
+# But each CTA only owns m_block_size rows
+cta_tiler = (q_stage * m_block_size, n_block_size, head_dim)
+
+# 2-CTA is beneficial for:
+# - Large head dimensions (hdim=192) where SMEM per CTA is tight
+# - When the M dimension naturally aligns with 2x the block size
+# - When amortizing K/V loading across more query rows
+
+# FA4 configuration (from flash_fwd_sm100.py):
+use_2cta_instrs = True  # For larger configurations
+cta_group_size = 2 if use_2cta_instrs else 1
+```
+
 ## Key Takeaways
 - UMMA's M dimension flexibility (64/128/256) is a major upgrade from WGMMA's fixed M=64, reducing tiling overhead for large attention tiles
 - The 32-bit instruction descriptor encodes all MMA parameters in a single integer, including data types, dimensions, layout modes, and MX scaling -- understanding its bit-fields is essential for debugging and tuning

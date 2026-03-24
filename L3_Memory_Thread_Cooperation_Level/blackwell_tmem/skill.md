@@ -103,6 +103,117 @@ PTX EXAMPLE:
 - Prototyping in Triton or high-level frameworks that abstract away memory management (TMEM is only accessible via PTX/CUTLASS)
 - Kernels that do not use tensor core MMA (TMEM is specifically for tensor core operands)
 
+## Source Code Examples
+
+### TMEM Allocation and Attention Loop with Cross-Warpgroup Correction
+
+```cuda
+// Pseudo-CUDA with PTX intrinsics for TMEM usage
+
+__device__ void attention_with_tmem() {
+    // Allocate TMEM for output accumulator
+    uint32_t tmem_O;
+    asm volatile("tcgen05.alloc %0, 128;" : "=r"(tmem_O));  // 128 columns
+
+    // Allocate TMEM for score matrix
+    uint32_t tmem_S;
+    asm volatile("tcgen05.alloc %0, 128;" : "=r"(tmem_S));  // 128 columns
+
+    // Zero-initialize O accumulator in TMEM
+    // (use tcgen05.st to write zeros)
+
+    // Main loop over K/V tiles
+    for (int j = 0; j < num_kv_tiles; j++) {
+        // TMA load K_j, V_j to SMEM (same as FA3)
+        // ...
+
+        // MMA: S = Q @ K_j^T, result in TMEM
+        asm volatile(
+            "tcgen05.mma.cta_group::1 %0, %1, %2;"
+            : "+r"(tmem_S)
+            : "l"(smem_desc_Q), "l"(smem_desc_K)
+        );
+
+        // Signal softmax warps: "S is ready in TMEM"
+        // Softmax warps read S from TMEM, compute P, write P to TMEM
+        // ...
+
+        // MMA: O += P @ V, accumulate in TMEM
+        asm volatile(
+            "tcgen05.mma.cta_group::1 %0, %1, %2;"
+            : "+r"(tmem_O)
+            : "r"(tmem_P), "l"(smem_desc_V)
+        );
+    }
+
+    // Read final O from TMEM to registers for epilogue
+    float O_regs[HEAD_DIM_PER_THREAD];
+    asm volatile(
+        "tcgen05.ld.16x64b {%0, %1, ...}, [%2];"
+        : "=f"(O_regs[0]), "=f"(O_regs[1]) /* ... */
+        : "r"(tmem_O)
+    );
+
+    // Normalize and store to HBM
+    // ...
+
+    // Deallocate TMEM
+    asm volatile("tcgen05.dealloc %0, 128;" :: "r"(tmem_O));
+    asm volatile("tcgen05.dealloc %0, 128;" :: "r"(tmem_S));
+}
+```
+
+### Cross-Warpgroup Correction Pattern
+
+```cuda
+// MMA warpgroup: accumulates O in TMEM
+__device__ void mma_warp_role(uint32_t tmem_O, uint32_t tmem_S, uint32_t tmem_P) {
+    for (int j = 0; j < num_kv_tiles; j++) {
+        // S = Q @ K_j^T -> TMEM
+        tcgen05_mma(tmem_S, smem_Q, smem_K[j]);
+
+        // Signal softmax
+        barrier_arrive(softmax_ready_barrier[j]);
+        barrier_wait(P_ready_barrier[j]);
+
+        // O += P @ V -> TMEM
+        tcgen05_mma(tmem_O, tmem_P, smem_V[j]);
+
+        // Signal correction (if softmax detected large max change)
+        if (needs_correction[j]) {
+            barrier_arrive(correction_needed_barrier[j]);
+        }
+    }
+}
+
+// Correction warpgroup: rescales O when needed
+__device__ void correction_warp_role(uint32_t tmem_O, float* m_history) {
+    for (int j = 0; j < num_kv_tiles; j++) {
+        // Only activate when correction is needed (~10% of iterations)
+        if (barrier_try_wait(correction_needed_barrier[j])) {
+            float m_old = m_history[j-1];
+            float m_new = m_history[j];
+            float alpha = exp2f(m_old - m_new);
+
+            // Read O from TMEM (cross-warpgroup access!)
+            float O_local[TILE_SIZE];
+            tcgen05_ld(O_local, tmem_O, offset);
+
+            // Rescale
+            for (int i = 0; i < TILE_SIZE; i++) {
+                O_local[i] *= alpha;
+            }
+
+            // Write back to TMEM
+            tcgen05_st(tmem_O, offset, O_local);
+
+            // Signal that correction is complete
+            barrier_arrive(correction_done_barrier[j]);
+        }
+    }
+}
+```
+
 ## Key Takeaways
 - TMEM is Blackwell's answer to the register pressure problem that plagued attention kernel pipelining on Hopper -- it provides dedicated storage for MMA accumulators outside the general register file
 - The critical capability is cross-warpgroup access: TMEM accumulators can be read and modified by warpgroups other than the one that computed them, enabling FA4's decoupled correction warpgroup

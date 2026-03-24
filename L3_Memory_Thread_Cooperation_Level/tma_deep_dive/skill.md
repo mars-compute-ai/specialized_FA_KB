@@ -66,6 +66,44 @@ Steady State: Memory latency fully hidden; compute units never idle
 - High-level framework code where memory management is abstracted away
 - Prototyping/debugging where simple load patterns are easier to reason about
 
+## Source Code Examples
+
+### Traditional 2D Tile Loading (Every Thread Computes)
+
+```cuda
+// Traditional: Each thread in a warp computes its own address
+int row = blockIdx.y * TILE_M + threadIdx.y;
+int col = blockIdx.x * TILE_N + threadIdx.x;
+float val = A[row * stride + col];  // Pointer arithmetic
+__shared__ float smem[TILE_M][TILE_N];
+smem[threadIdx.y][threadIdx.x] = val;
+```
+
+Problems with this approach:
+- Every thread wastes registers on row, col, stride computations
+- Bounds checking requires manual if-statements
+- Bank conflicts require manual swizzling in shared memory layout
+- No overlap: all threads must finish loading before any can compute
+
+### TMA Single-Thread Issuance
+
+```cuda
+// TMA: One thread issues the entire tile transfer
+if (threadIdx.x == 0) {
+    // Just provide logical coordinates — TMA handles the rest
+    tma_load_2d(descriptor, smem_ptr, tile_row, tile_col, barrier);
+}
+// All threads immediately proceed to compute on previous data
+__syncthreads();  // or mbarrier wait
+```
+
+Benefits of TMA:
+- One thread issues the transfer; all others are free to compute
+- No pointer arithmetic -- descriptor encodes layout
+- Automatic bounds checking -- no if-statements for edge tiles
+- Hardware swizzling -- bank conflicts eliminated by descriptor
+- Asynchronous -- compute overlaps with next tile's loading
+
 ## Key Takeaways
 - TMA transforms data loading from an "all-threads-busy" synchronous operation to a "one-thread-issues, hardware-executes" asynchronous operation
 - The conveyor-belt model (load next while computing current) is the fundamental design pattern for all high-performance Hopper kernels

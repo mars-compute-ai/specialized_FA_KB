@@ -66,6 +66,45 @@ Column 0 access: Thread 0→B0, Thread 1→B1, Thread 2→B2
 - Very small tiles where the indexing overhead of swizzling exceeds the bank conflict cost
 - Non-NVIDIA hardware where shared memory bank organization differs
 
+## Source Code Examples
+
+### XOR Swizzle Transformation Steps
+
+The three-step transformation to apply XOR-based swizzling:
+
+**Step 1** -- Convert 2D index to byte-level chunk position:
+```
+x_chunk = (x * sizeof(element)) / bank_width_bytes
+y_chunk = y  (or relevant bits of y)
+```
+
+**Step 2** -- Apply XOR operation:
+```
+x_chunk_swizzled = y_chunk XOR x_chunk
+```
+
+**Step 3** -- Convert back to address:
+```
+swizzled_address = y * row_stride + x_chunk_swizzled * bank_width_bytes + (x * sizeof(element)) % bank_width_bytes
+```
+
+### Practical Swizzle Function (CuTe/CUTLASS)
+
+```cpp
+// CuTe swizzle layout for shared memory
+using SmemLayoutAtom = composition(
+    Swizzle<3, 3, 3>{},           // XOR-based swizzle pattern
+    Layout<Shape<_8, _64>, Stride<_64, _1>>{}  // Base row-major layout
+);
+```
+
+The `Swizzle<B,M,S>` template parameters control:
+- **B** (bits): Number of XOR bits
+- **M** (mask): Which column bits participate
+- **S** (shift): Offset of the row bits used for XOR
+
+TMA descriptors on Hopper can also encode swizzle patterns, meaning the hardware applies swizzling automatically during data transfer with zero software overhead.
+
 ## Key Takeaways
 - Bank conflicts are a **silent performance killer** — they do not cause errors, only slowdowns (up to 32x)
 - XOR-based swizzling is the **standard solution** in all production CUDA kernels (CUTLASS, Flash Attention, cuBLAS)

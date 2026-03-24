@@ -120,6 +120,108 @@ omniperf analyze -p workloads/attention_profile/MI300X/
 - For end-to-end model profiling without kernel-level detail (use Omnitrace alone)
 - On NVIDIA GPUs (use Nsight Compute/Nsight Systems instead)
 
+## Source Code Examples
+
+### rocprof Counter Specification (bash)
+
+Create a counter specification file with multiple passes (4-8 PMCs per pass due to hardware counter multiplexing):
+
+```bash
+# Create counter specification file
+cat > counters.txt << 'EOF'
+# Pass 1: Compute utilization
+pmc: SQ_WAVES SQ_INSTS_VALU SQ_INSTS_VALU_MFMA SQ_BUSY_CYCLES GRBM_GUI_ACTIVE
+
+# Pass 2: Memory hierarchy
+pmc: TCC_EA_RDREQ_32B_sum TCC_EA_WRREQ_32B_sum TCC_HIT_sum TCC_MISS_sum
+
+# Pass 3: LDS and stalls
+pmc: SQ_LDS_BANK_CONFLICT SQ_WAIT_INST_VMEM SQ_WAIT_INST_LDS SQ_INSTS_LDS
+
+# Pass 4: Special function units
+pmc: SQ_INSTS_VALU_TRANS SQ_INSTS_SALU SQ_INSTS_SMEM
+EOF
+
+# Profile with kernel name filter
+rocprof -i counters.txt --kernel-name "attention" -o results.csv python script.py
+```
+
+### Targeted Counter Collection (bash)
+
+```bash
+# Quick check: is attention compute-bound or memory-bound?
+rocprof --pmc SQ_INSTS_VALU_MFMA,TCC_EA_RDREQ_32B_sum,GRBM_GUI_ACTIVE \
+    --kernel-name "attention" -- python script.py
+
+# Compute utilization breakdown
+rocprof --pmc SQ_INSTS_VALU_MFMA,SQ_INSTS_VALU_TRANS,SQ_INSTS_VALU,SQ_INSTS_SALU \
+    --kernel-name "attention" -- python script.py
+
+# LDS efficiency
+rocprof --pmc SQ_INSTS_LDS,SQ_LDS_BANK_CONFLICT,SQ_WAIT_INST_LDS \
+    --kernel-name "attention" -- python script.py
+```
+
+### Omniperf Profile and Analyze Commands (bash)
+
+```bash
+# Profile: collects counters across multiple auto-generated passes
+omniperf profile -n flash_attn_profile -- python model.py
+
+# Analyze: compute derived metrics and display results
+omniperf analyze -p workloads/flash_attn_profile/MI300X/
+
+# Analyze specific sections
+omniperf analyze -p workloads/my_kernel/MI300X/ --block 0    # System SoL
+omniperf analyze -p workloads/my_kernel/MI300X/ --block 2    # CU metrics
+omniperf analyze -p workloads/my_kernel/MI300X/ --block 5    # LDS
+omniperf analyze -p workloads/my_kernel/MI300X/ --block 7    # HBM
+omniperf analyze -p workloads/my_kernel/MI300X/ --block 10   # Instruction mix
+omniperf analyze -p workloads/my_kernel/MI300X/ --block 12   # Wavefront
+
+# Filter to specific kernel
+omniperf analyze -p workloads/my_kernel/MI300X/ --filter-kernel-names "fmha"
+
+# Compare two profiles (before/after optimization)
+omniperf analyze -p workloads/baseline/MI300X/ -p workloads/optimized/MI300X/
+
+# Launch web dashboard
+omniperf analyze -p workloads/my_kernel/MI300X/ --gui --port 8080
+```
+
+### Python Script for Computing Derived Metrics from rocprof Output
+
+```python
+import pandas as pd
+
+# Read rocprof CSV output
+df = pd.read_csv("results.csv")
+
+# MFMA utilization (approximate)
+# Each MFMA instruction takes N cycles depending on tile shape
+# MFMA_F32_16x16x16_F16: 16 cycles
+# MFMA_F32_32x32x8_F16: 32 cycles
+mfma_cycles = df['SQ_INSTS_VALU_MFMA'] * 16  # assuming 16x16x16
+total_cycles = df['SQ_BUSY_CYCLES']
+mfma_utilization = mfma_cycles / total_cycles * 100
+
+# HBM bandwidth (GB/s)
+hbm_bytes = (df['TCC_EA_RDREQ_32B_sum'] + df['TCC_EA_WRREQ_32B_sum']) * 32
+kernel_time_ns = df['DurationNs']
+hbm_bandwidth_gbps = hbm_bytes / kernel_time_ns  # GB/s
+
+# LDS bank conflict rate
+lds_conflict_rate = df['SQ_LDS_BANK_CONFLICT'] / df['SQ_INSTS_LDS'] * 100
+
+# L2 cache hit rate
+l2_hit_rate = df['TCC_HIT_sum'] / (df['TCC_HIT_sum'] + df['TCC_MISS_sum']) * 100
+
+print(f"MFMA utilization: {mfma_utilization:.1f}%")
+print(f"HBM bandwidth: {hbm_bandwidth_gbps:.0f} GB/s (peak: 5300 GB/s)")
+print(f"LDS bank conflict rate: {lds_conflict_rate:.1f}%")
+print(f"L2 hit rate: {l2_hit_rate:.1f}%")
+```
+
 ## Key Takeaways
 - Omniperf is the AMD equivalent of Nsight Compute -- it provides roofline analysis, derived metrics, and guided bottleneck identification; always start here for structured analysis
 - Omnitrace is the AMD equivalent of Nsight Systems -- use it first for timeline analysis to identify which kernel to profile deeply

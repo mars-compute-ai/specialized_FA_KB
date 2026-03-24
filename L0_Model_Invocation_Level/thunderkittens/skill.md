@@ -97,6 +97,60 @@ warpgroup::mma_async_wait();
 row_reduce(row_max, s_acc, kittens::base_ops::max);
 ```
 
+## Source Code Examples
+
+### Register Tile Declarations with Layout Semantics
+
+```cpp
+// kittens::rt_<type><rows, cols>
+kittens::rt_bf<32, 64> tile;    // 32x64 BF16 register tile, row-layout (default)
+kittens::rt_fl<16, 16> acc;     // 16x16 FP32 register tile (accumulator)
+kittens::rt_hf<64, 64> big;    // 64x64 FP16 register tile
+```
+
+```cpp
+// Shared tile declarations
+__shared__ kittens::st_bf<64, 64> k_tile;  // 64x64 BF16 in shared memory
+__shared__ kittens::st_hf<32, 64> v_tile;  // 32x64 FP16 in shared memory
+```
+
+Layout matters for correctness: ThunderKittens enforces layout compatibility at compile time via C++20 concepts. If you try to pass a row-layout tile as the B operand to `mma_AB`, you get a compile error, not a silent wrong answer.
+
+### TMA Async Operations
+
+On Hopper and Blackwell, shared tiles support asynchronous TMA (Tensor Memory Accelerator) operations:
+
+```cpp
+// Asynchronous load from global memory to shared tile
+tma::load_async(shared_tile, global_layout, {row_idx, col_idx}, barrier);
+
+// Asynchronous store from shared tile to global memory
+tma::store_async(global_layout, shared_tile, {row_idx, col_idx});
+```
+
+TMA operations are issued by a single thread (typically `laneid() == 0`) and complete asynchronously, freeing the warp for compute.
+
+### Register Vector Operations (Critical for Softmax)
+
+```cpp
+rt_fl<16, 64> s_acc;              // Attention scores tile
+rt_fl<16, 64>::col_vec row_max;   // Max per row (16 elements)
+rt_fl<16, 64>::col_vec row_sum;   // Sum per row (16 elements)
+
+// Row-wise max reduction
+row_reduce(row_max, s_acc, kittens::base_ops::max);
+
+// Subtract max and exponentiate (for numerical stability)
+sub_row(s_acc, s_acc, row_max);  // S[i][j] -= max[i]
+exp(s_acc, s_acc);                // S[i][j] = exp(S[i][j])
+
+// Row-wise sum
+row_reduce(row_sum, s_acc, kittens::base_ops::sum);
+
+// Normalize
+div_row(s_acc, s_acc, row_sum);  // S[i][j] /= sum[i]
+```
+
 ## Key Takeaways
 - ThunderKittens bridges the gap between raw CUDA complexity and library-level opacity by providing tile-granularity primitives
 - The 4 abstractions (register tiles, shared tiles, register vectors, shared vectors) map directly to GPU hardware resources

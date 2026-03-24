@@ -68,6 +68,69 @@ Thread-Data Mapping via Layout Composition:
 - When targeting non-NVIDIA hardware (CuTe is NVIDIA-specific)
 - Prototyping where Triton or similar DSLs offer faster iteration cycles
 
+## Source Code Examples
+
+### Layout Basics: Row-Major and Column-Major
+
+```cpp
+// A 4×8 row-major layout
+Layout<Shape<_4, _8>, Stride<_8, _1>> layout_4x8;
+// Logical coordinate (2, 3) → memory index: 2*8 + 3*1 = 19
+
+// A 4×8 column-major layout
+Layout<Shape<_4, _8>, Stride<_1, _4>> layout_4x8_col;
+// Logical coordinate (2, 3) → memory index: 2*1 + 3*4 = 14
+```
+
+### Tensor Creation in Different Memory Spaces
+
+```cpp
+// A tensor in global memory
+Tensor gmem_tensor = make_tensor(
+    make_gmem_ptr(data_ptr),      // Engine: global memory pointer
+    make_layout(Shape<_128, _64>{}, Stride<_64, _1>{})  // Layout
+);
+
+// A tensor in shared memory
+Tensor smem_tensor = make_tensor(
+    make_smem_ptr(smem_ptr),      // Engine: shared memory pointer
+    smem_layout                    // Layout (possibly swizzled)
+);
+
+// A tensor in registers
+Tensor reg_tensor = make_tensor(
+    make_rmem_ptr(reg_ptr),       // Engine: register reference
+    reg_layout                     // Layout
+);
+```
+
+### CuTe GEMM Outer Loop with Partitioning
+
+```cpp
+// Pseudocode for a CuTe GEMM kernel inner loop
+// 1. Partition tensors across threads according to TiledMMA
+auto thr_mma = tiled_mma.get_slice(thread_idx);
+auto tCrA = thr_mma.partition_A(sA);  // Shared memory A partition
+auto tCrB = thr_mma.partition_B(sB);  // Shared memory B partition
+auto tCrC = thr_mma.partition_C(gC);  // Register accumulator partition
+
+// 2. Clear accumulators
+clear(tCrC);
+
+// 3. Execute GEMM: iterate over K dimension
+for (int k = 0; k < K_TILES; ++k) {
+    // Copy from shared memory to register memory
+    copy(tCrA(_, _, k), rA);
+    copy(tCrB(_, _, k), rB);
+
+    // Execute MMA: (V,M,K) × (V,N,K) => (V,M,N)
+    gemm(tiled_mma, rA, rB, tCrC);
+}
+
+// 4. Write back results
+copy(tCrC, gC_partition);
+```
+
 ## Key Takeaways
 - CuTe's core insight: **threads and data should be described with the same vocabulary** (Layout), and their interaction should be expressed as **functional composition**
 - Layout algebra replaces hundreds of lines of manual index arithmetic with a single compose operation

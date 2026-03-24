@@ -86,6 +86,56 @@ for k = 0 to K/BK:
 - Very small matrices where kernel launch overhead dominates and batching/fusion is a better strategy
 - When Triton or other compiler-based approaches can automatically handle tiling and pipelining decisions
 
+## Source Code Examples
+
+### Double Buffer Declaration (C++)
+
+```cpp
+__shared__ InputType tile_a[2][BM * BK];  // Double buffer
+__shared__ InputType tile_b[2][BK * BN];
+```
+
+### K-Loop with Buffer Toggling (C++)
+
+```cpp
+// K-loop with buffer toggling
+for (int k = 0; k < K; k += BK) {
+    int read_buf = k_iter % 2;
+    int write_buf = (k_iter + 1) % 2;
+
+    // Load next tile into write_buf (async/prefetch)
+    load_tile(A, tile_a[write_buf], ...);
+    load_tile(B, tile_b[write_buf], ...);
+
+    __syncthreads();
+
+    // Compute using read_buf
+    compute(tile_a[read_buf], tile_b[read_buf], result);
+
+    __syncthreads();
+}
+```
+
+### Global Memory Coalescing (C++)
+
+```cpp
+output_row = blockIdx.x * block_size + (threadIdx.x / block_size);
+output_col = blockIdx.y * block_size + (threadIdx.x % block_size);
+```
+
+### 1D Block Tiling with Register Reuse (C++)
+
+```cpp
+float b_tmp = tile_b[dot_idx * BN + thread_col];
+for (uint res_idx = 0; res_idx < TM; ++res_idx) {
+    thread_results[res_idx] += tile_a[...] * b_tmp;
+}
+```
+
+### WMMA Tensor Core Usage
+
+WMMA provides warp-level collective matrix multiply operations. The hardware executes instructions like `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` for 16x8x8 operations. With WMMA and double buffering on BF16 matrices, performance reaches ~58 TFLOPS (~40% of PyTorch), demonstrating that tensor cores are mandatory for competitive low-precision performance (BF16 without WMMA achieves only ~25%).
+
 ## Key Takeaways
 - The biggest single optimization jump comes from **register-level tiling** (1D/2D block tiling): going from 7.7% to 38.7% of peak by increasing arithmetic intensity
 - **Memory coalescing** is the prerequisite: without it, all other optimizations are bottlenecked by inefficient global memory access

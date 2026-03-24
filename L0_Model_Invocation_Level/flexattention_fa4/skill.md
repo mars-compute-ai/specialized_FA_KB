@@ -60,6 +60,20 @@ block_mask = create_block_mask(sliding_window_mask, B, H, S, S)
 out = flex_fa4(q, k, v, block_mask=block_mask)
 ```
 
+## Source Code Examples
+
+### Sliding Window + Causal Combination
+
+```python
+def sliding_window_with_causal(score, b_idx, h_idx, q_idx, kv_idx):
+    """Sliding window + causal masking"""
+    causal_mask = q_idx >= kv_idx
+    window_mask = torch.abs(q_idx - kv_idx) <= 128
+    return torch.where(causal_mask & window_mask, score, float('-inf'))
+
+out = flex_flash(q, k, v, score_mod=sliding_window_with_causal)
+```
+
 ## Key Takeaways
 - FlexAttention + FA4 is the preferred path for custom attention on Hopper/Blackwell GPUs, offering 1.2-3.2x speedup over the Triton backend
 - The `score_mod` API is simple: write a Python function with 5 arguments, the compiler handles the rest

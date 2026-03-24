@@ -90,6 +90,53 @@ for tile in range(num_tiles):
 - On pre-Hopper architectures that lack TMA and WGMMA (use cp.async + HMMA instead)
 - For very small problem sizes where pipeline startup cost dominates
 
+## Source Code Examples
+
+### Complete Producer-Consumer Loop Structure
+
+Circular buffer pattern with `PIPE` stages of outstanding TMA loads, coordinated via mbarrier synchronization:
+
+```
+# Pipeline with PIPE stages of outstanding TMA loads
+
+# Producer warp (TMA loads)
+for k_tile in range(num_tiles):
+    slot = k_tile % PIPE
+    wait_for_slot_consumed(slot)      # Wait until consumer released this slot
+    async_tma_load(smem[slot], gmem[k_tile])
+    signal_load_complete(slot)
+
+# Consumer warp (WGMMA compute)
+for k_tile in range(num_tiles):
+    slot = k_tile % PIPE
+    wait_for_load_complete(slot)      # Wait until producer filled this slot
+    async_wgmma(accum, smem[slot])
+    signal_slot_consumed(slot)        # Release slot for reuse
+```
+
+### Pipelined Loop Alternative (Without Full Warp Specialization)
+
+Issues multiple pending MMAs before synchronization to hide latency through instruction-level parallelism. This can sometimes achieve equivalent performance to full warp specialization:
+
+```
+for tile in range(num_tiles):
+    # Issue next TMA load (non-blocking)
+    if tile + PIPE < num_tiles:
+        cp.async.bulk.tensor.2d(smem[(tile+PIPE) % PIPE], ...)
+
+    # Wait for current tile's load to complete
+    mbarrier_wait(full_barrier[tile % PIPE])
+
+    # Issue multiple WGMMA instructions before any sync
+    wgmma.mma_async(accum, smem_A[tile % PIPE], smem_B[tile % PIPE])
+    wgmma.mma_async(accum, smem_A2[tile % PIPE], smem_B2[tile % PIPE])
+    # ... more MMAs to keep Tensor Cores busy
+
+    # Only sync after issuing enough work
+    wgmma.commit_group()
+    wgmma.wait_group(N-1)  # Wait for all but N-1 groups
+```
+
 ## Key Takeaways
 - GPUs are in-order processors; warp specialization is the primary mechanism for creating out-of-order-like behavior
 - The producer-consumer pattern with circular buffers is the fundamental building block for instruction overlap

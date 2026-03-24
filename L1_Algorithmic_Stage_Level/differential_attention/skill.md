@@ -75,6 +75,42 @@ O = concat(O_head for each head) @ W_O
 - Very short sequences where attention noise is minimal and the differential mechanism provides negligible benefit
 - When bit-exact compatibility with standard transformer checkpoints is required
 
+## Code / Pseudo-code
+
+### Integration with FlashAttention Libraries
+
+Using two standard FlashAttention calls to implement differential attention without custom kernels:
+
+```python
+# Approach: Two calls to FlashAttention, then combine
+
+import flash_attn
+
+def diff_attention_flash(Q, K, V, lambda_param, lambda_init=0.8):
+    B, N, H, D = Q.shape
+    D_half = D // 2
+
+    # Split Q and K
+    Q1, Q2 = Q[..., :D_half], Q[..., D_half:]
+    K1, K2 = K[..., :D_half], K[..., D_half:]
+
+    # Two FlashAttention calls (each with half head dim)
+    O1 = flash_attn.flash_attn_func(Q1, K1, V, causal=True)
+    O2 = flash_attn.flash_attn_func(Q2, K2, V, causal=True)
+
+    # Differential combination
+    O_diff = O1 - lambda_param * O2
+
+    # GroupNorm and scaling
+    O_diff = F.group_norm(O_diff.reshape(B*N, H, D),
+                          num_groups=H).reshape(B, N, H, D)
+    O_diff = O_diff * (1 - lambda_init)
+
+    return O_diff
+```
+
+This approach uses two FlashAttention kernel launches but still avoids materializing N x N matrices. A fused kernel (single launch) would be more efficient but requires custom CUDA code.
+
 ## Key Takeaways
 - Differential attention achieves the quality of a 11B-parameter standard transformer with only a 7B-parameter Diff Transformer (roughly 3/5 the size), as demonstrated on language modeling benchmarks
 - The noise cancellation effect is measurable: attention entropy is lower, and the model attends more precisely to relevant tokens with less probability mass on irrelevant context

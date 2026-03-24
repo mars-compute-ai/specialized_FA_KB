@@ -86,6 +86,56 @@ __global__ void softmax_warp(half4* input, half4* output, int M, int N) {
 - When Triton or framework-provided fused kernels already achieve satisfactory performance
 - Prototyping where development speed matters more than runtime performance
 
+## Source Code Examples
+
+### Complete warpReduceMax Template
+
+Warp-level maximum reduction using `__shfl_xor_sync()` -- reduces 32 values to one in 5 iterations entirely in registers:
+
+```cuda
+template <typename T, int NUM>
+__inline__ __device__ T warpReduceMax(T* val, int thread_group_width = 32) {
+#pragma unroll
+  for (int i = 0; i < NUM; i++) {
+#pragma unroll
+    for (int mask = thread_group_width / 2; mask > 0; mask >>= 1) {
+      val[i] = max(val[i], __shfl_xor_sync(0xffffffff, val[i], mask, 32));
+    }
+  }
+  return (T)(0.0f);
+}
+```
+
+### blockReduceSum with Shared Memory
+
+Two-stage block-level sum reduction -- first reduces within warps, then uses shared memory with padding (`[33]` to avoid bank conflicts) to reduce across warps:
+
+```cuda
+template <typename T, int NUM>
+__inline__ __device__ T blockReduceSum(T* val) {
+  __shared__ T shared[NUM][33];
+  int lane = threadIdx.x & 0x1f;
+  int wid = threadIdx.x >> 5;
+
+  // Stage 1: Reduce within each warp
+  warpReduceSum<T, NUM>(val);
+  if (lane == 0) {
+#pragma unroll
+    for (int i = 0; i < NUM; i++) {
+      shared[i][wid] = val[i];
+    }
+  }
+  __syncthreads();
+
+  // Stage 2: Reduce warp results
+  for (int i = 0; i < NUM; i++) {
+    val[i] = threadIdx.x < (blockDim.x / 32.f) ? shared[i][lane] : (T)(0.0f);
+  }
+  if(wid==0) warpReduceSum<T, NUM>(val);
+  return (T)0.0f;
+}
+```
+
 ## Key Takeaways
 - **Warp shuffles are the key primitive**: `__shfl_xor_sync()` enables register-only reductions that avoid shared memory latency entirely
 - **Vectorized loads (half4/float4) provide up to 50% speedup** by reducing memory transaction count

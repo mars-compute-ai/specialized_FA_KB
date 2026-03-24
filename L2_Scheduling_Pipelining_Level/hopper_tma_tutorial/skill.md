@@ -103,6 +103,56 @@ DEVICE KERNEL (__grid_constant__ tma_load):
 - When stride alignment requirements (16-byte multiples) cannot be met by the tensor layout
 - Prototyping with Triton, which abstracts TMA usage automatically
 
+## Source Code Examples
+
+### Host-Side TMA Descriptor Setup (C++)
+
+The `make_tma_copy()` function creates a `CUtensorMap` descriptor from global memory tensor and shared memory layout:
+
+```cpp
+// GMEM tensor definition
+auto gmem_layout = make_layout(make_shape(M, N), LayoutRight{});
+auto gmem_tensor = make_tensor(make_gmem_ptr(data), gmem_layout);
+
+// SMEM layout specification
+auto smem_layout = make_layout(make_shape(CTA_M, CTA_N), LayoutRight{});
+
+// TMA descriptor creation
+auto tma_load = make_tma_copy(SM90_TMA_LOAD{}, gmem_tensor, smem_layout);
+```
+
+### Device-Side TMA Load Execution Pattern (C++)
+
+TMA uses coordinate-based addressing with automatic out-of-bounds predication:
+
+```cpp
+// Coordinate-based tile addressing (no manual pointer arithmetic)
+auto gmem_tensor_coord = tma_load.get_tma_tensor(shape(gmem_tensor));
+auto gmem_tensor_coord_cta = local_tile(
+    gmem_tensor_coord,
+    Tile<Int<CTA_M>, Int<CTA_N>>{},
+    make_coord(blockIdx.x, blockIdx.y));
+```
+
+### Asynchronous Barrier (mbarrier) Synchronization
+
+```cpp
+// Initialize barrier with arrival count and expected bytes
+initialize_barrier(tma_load_mbar, 1);  // arrival count = 1
+set_barrier_transaction_bytes(tma_load_mbar, num_bytes);
+
+// Issue TMA load and wait for completion
+copy(tma_load.with(tma_load_mbar), source, destination);
+__syncthreads();
+wait_barrier(tma_load_mbar, 0);  // phase = 0
+```
+
+### TMA Store Setup
+
+```cpp
+auto tma_store = make_tma_copy(SM90_TMA_STORE{}, gmem_tensor, smem_layout);
+```
+
 ## Key Takeaways
 - TMA shifts data movement from "every thread computes and loads" to "one thread commands, hardware executes"--fundamentally changing kernel design toward warp specialization
 - The mbarrier with phase bits is the synchronization primitive that makes multi-stage pipelines correct: `producer_acquire/commit` + `consumer_wait/release` form a clean four-method API

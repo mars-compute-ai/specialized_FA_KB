@@ -82,6 +82,74 @@ for each request with appended tokens:
 - On non-NVIDIA hardware (AMD/TPU) -- FlashInfer currently targets CUDA
 - When the model does not use standard softmax attention (e.g., linear attention, state-space models)
 
+## Code / Pseudo-code
+
+### Python: BatchPrefillWithPagedKVCacheWrapper Usage
+
+From FlashInfer's `prefill.py` -- the primary API for batched prefill with paged KV-Cache:
+
+```python
+import torch
+import flashinfer
+
+num_layers = 32
+num_qo_heads = 64
+num_kv_heads = 16
+head_dim = 128
+max_num_pages = 128
+page_size = 16
+
+# Allocate 128MB workspace buffer
+workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    workspace_buffer, "NHD"
+)
+
+batch_size = 7
+nnz_qo = 100
+qo_indptr = torch.tensor(
+    [0, 33, 44, 55, 66, 77, 88, nnz_qo], dtype=torch.int32, device="cuda:0"
+)
+paged_kv_indices = torch.arange(max_num_pages).int().to("cuda:0")
+paged_kv_indptr = torch.tensor(
+    [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
+)
+# 1 <= paged_kv_last_page_len <= page_size
+paged_kv_last_page_len = torch.tensor(
+    [1, 7, 14, 4, 3, 1, 16], dtype=torch.int32, device="cuda:0"
+)
+q_at_layer = torch.randn(num_layers, nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
+kv_cache_at_layer = torch.randn(
+    num_layers, max_num_pages, 2, page_size, num_kv_heads, head_dim,
+    dtype=torch.float16, device="cuda:0"
+)
+
+# Create auxiliary data structures for batch prefill attention
+prefill_wrapper.plan(
+    qo_indptr,
+    paged_kv_indptr,
+    paged_kv_indices,
+    paged_kv_last_page_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    page_size,
+    causal=True,
+)
+
+# Run prefill across layers, reusing auxiliary data structures
+outputs = []
+for i in range(num_layers):
+    q = q_at_layer[i]
+    kv_cache = kv_cache_at_layer[i]
+    o = prefill_wrapper.run(q, kv_cache)
+    outputs.append(o)
+
+# outputs[0].shape => torch.Size([100, 64, 128])
+```
+
+Key API pattern: `plan()` precomputes scheduling metadata once, then `run()` executes attention across layers reusing that metadata.
+
 ## Key Takeaways
 - LLM inference has fundamentally different compute characteristics across phases: prefill is compute-bound, decode is memory-bound, and they need different kernel strategies
 - Page-table-based KV-Cache (like virtual memory for attention) is the standard for production serving, and kernels must handle the indirection efficiently

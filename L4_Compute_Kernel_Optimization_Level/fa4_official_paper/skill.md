@@ -103,6 +103,62 @@ O_final = O / l_final   # absorbs all lazy rescaling deviations
 - fp64 workloads requiring full-precision exponentials
 - Prototyping or research where kernel development time is the constraint (use Triton instead)
 
+## Source Code Examples
+
+### FA4 Forward Pass Pseudocode with Polynomial exp2 and Conditional Rescaling
+
+Complete softmax-MMA pipeline showing the polynomial exp2 implementation (Horner's method, 3 FMA ops) and conditional rescaling logic with threshold tau:
+
+```python
+# FA4 Forward Pass: Softmax-MMA Pipeline (Blackwell)
+
+# Two warpgroups (WG0, WG1) per thread block, each processing a Q tile
+# Main loop: for each K,V tile pair
+# parallel:
+#     WG0: MMA(Q_tile_0, K_tile) -> S_tile_0    # tensor cores
+#     WG1: softmax(S_tile_1) -> P_tile_1         # FMA + SFU
+# barrier()
+# parallel:
+#     WG0: softmax(S_tile_0) -> P_tile_0         # FMA + SFU
+#     WG1: MMA(P_tile_1, V_tile) -> O_tile_1     # tensor cores
+
+# Softmax with partial emulation and conditional rescaling:
+def softmax_with_fa4_opts(S_tile, m_old, l_old, O_old):
+    m_new = rowmax(S_tile)
+
+    # Conditional rescaling (lazy update)
+    if m_new > m_old + TAU:     # TAU = 8.0 = log2(256)
+        alpha = exp2(m_old - m_new)
+        O = alpha * O_old
+        l = alpha * l_old
+        m_old = m_new
+    else:
+        O = O_old
+        l = l_old
+
+    # Partial polynomial emulation for exp2
+    for i in range(len(S_tile)):
+        x = S_tile[i] - m_old
+        if i % EMULATION_RATIO == 0:       # 10-25% polynomial
+            P[i] = poly_exp2(x)             # cubic on FMA units
+        else:
+            P[i] = hardware_exp2(x)         # SFU (MUFU.EX2)
+
+    l = l + rowsum(P)
+    return P, m_old, l, O
+
+# Polynomial exp2 (Horner's method, 3 FMA ops)
+def poly_exp2(x):
+    x_floor = floor(x)
+    f = x - x_floor
+    # Sollya-optimized coefficients for minimax on [0,1)
+    result = ((p3 * f + p2) * f + p1) * f + 1.0
+    return ldexp(result, x_floor)
+
+# After all K,V tiles processed:
+O_final = O / l_final   # absorbs all lazy rescaling deviations
+```
+
 ## Key Takeaways
 - **Exponential throughput is a first-order bottleneck** on Blackwell, equal to MMA itself for typical head dimensions
 - **Partial polynomial emulation (10-25% of entries)** effectively supplements SFU throughput without excessive register pressure

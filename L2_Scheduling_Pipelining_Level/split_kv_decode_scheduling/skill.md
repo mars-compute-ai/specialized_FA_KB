@@ -132,6 +132,130 @@ def choose_num_splits(B, H, S, num_SMs, BLOCK_KV=256):
 - When the reduction kernel's extra global memory write/read becomes a significant fraction of total time (very small d, very large num_splits)
 - Training forward/backward passes that already parallelize over the Q dimension
 
+## Source Code Examples
+
+### FlashInfer Split-KV Decode Kernel (C++)
+
+```cpp
+// From FlashInfer attention kernel (simplified)
+template <typename T, int HEAD_DIM, int BLOCK_KV>
+__global__ void BatchDecodeWithPagedKVCacheSplitKV(
+    T* __restrict__ q,           // [B, H, d]
+    T* __restrict__ kv_cache,    // paged KV cache
+    int* __restrict__ page_table, // page indirection
+    float* __restrict__ o_partial, // [B, H, num_splits, d]
+    float* __restrict__ lse_partial, // [B, H, num_splits]
+    int seq_len,
+    int num_splits)
+{
+    const int split_id = blockIdx.x;
+    const int bh_id = blockIdx.y;  // b * H + h
+
+    const int split_size = (seq_len + num_splits - 1) / num_splits;
+    const int kv_start = split_id * split_size;
+    const int kv_end = min(kv_start + split_size, seq_len);
+
+    // Load Q to shared memory (1 row of d elements)
+    __shared__ T q_smem[HEAD_DIM];
+    load_q_to_smem(q, q_smem, bh_id);
+    __syncthreads();
+
+    // Online softmax over this KV range
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o[HEAD_DIM / WARP_SIZE] = {0};  // register-resident output
+
+    for (int kv_offset = kv_start; kv_offset < kv_end; kv_offset += BLOCK_KV) {
+        // Load K, V tiles from paged cache
+        T k_tile[BLOCK_KV][HEAD_DIM];  // simplified -- actually in SMEM
+        T v_tile[BLOCK_KV][HEAD_DIM];
+        load_paged_kv(kv_cache, page_table, kv_offset, k_tile, v_tile);
+
+        // Compute attention scores: Q @ K^T
+        float s[BLOCK_KV];
+        compute_qk(q_smem, k_tile, s);  // uses tensor cores or VFMA
+
+        // Online softmax update
+        float m_new = m;
+        for (int i = 0; i < BLOCK_KV; i++) {
+            m_new = fmaxf(m_new, s[i]);
+        }
+        float alpha = expf(m - m_new);
+        l = alpha * l;
+        m = m_new;
+
+        float p[BLOCK_KV];
+        for (int i = 0; i < BLOCK_KV; i++) {
+            p[i] = expf(s[i] - m);
+            l += p[i];
+        }
+
+        // O += P @ V
+        accumulate_pv(p, v_tile, o, alpha);
+    }
+
+    // Store partial results
+    store_partial_output(o_partial, lse_partial, o, m, l, bh_id, split_id);
+}
+
+// Reduction kernel
+template <int HEAD_DIM>
+__global__ void MergeSplitKVOutputs(
+    float* __restrict__ o_partial,  // [B, H, num_splits, d]
+    float* __restrict__ lse_partial, // [B, H, num_splits]
+    half* __restrict__ o_final,      // [B, H, d]
+    int num_splits)
+{
+    const int bh_id = blockIdx.x;
+
+    // Find global LSE
+    float global_lse = -INFINITY;
+    for (int i = 0; i < num_splits; i++) {
+        global_lse = logaddexpf(global_lse, lse_partial[bh_id * num_splits + i]);
+    }
+
+    // Weighted combination
+    float o[HEAD_DIM] = {0};
+    for (int i = 0; i < num_splits; i++) {
+        float weight = expf(lse_partial[bh_id * num_splits + i] - global_lse);
+        for (int j = 0; j < HEAD_DIM; j++) {
+            o[j] += weight * o_partial[bh_id * num_splits * HEAD_DIM + i * HEAD_DIM + j];
+        }
+    }
+
+    // Store final output
+    for (int j = 0; j < HEAD_DIM; j++) {
+        o_final[bh_id * HEAD_DIM + j] = __float2half(o[j]);
+    }
+}
+```
+
+### FlashInfer Python API for Split-KV Decode
+
+```python
+import flashinfer
+
+# Setup decode handler with split-KV
+decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+    workspace_buffer,
+    kv_layout="NHD",
+)
+
+# Plan: determines num_splits and workspace allocation
+decode_wrapper.plan(
+    indptr=kv_indptr,
+    indices=kv_indices,
+    last_page_len=kv_last_page_len,
+    num_qo_heads=num_q_heads,
+    num_kv_heads=num_kv_heads,
+    head_dim=head_dim,
+    page_size=page_size,
+)
+
+# Run: executes split-KV attention + reduction
+output = decode_wrapper.run(q, kv_data)
+```
+
 ## Key Takeaways
 - The decode-phase attention scheduling problem is fundamentally different from prefill: Q is tiny (1 token) while KV is large, so parallelism must come from splitting KV, not Q
 - Split-KV is mathematically exact -- the log-sum-exp reduction produces bit-identical results to non-split attention (up to floating-point associativity)

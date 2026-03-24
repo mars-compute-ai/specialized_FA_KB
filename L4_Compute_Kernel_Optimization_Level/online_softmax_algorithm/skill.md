@@ -77,6 +77,62 @@ for each Q_tile (Br x d):
 - When you need the full attention matrix for analysis/visualization (online softmax never materializes it)
 - Non-attention use cases where softmax is over a small fixed vocabulary (e.g., classification head with <1000 classes)
 
+## Source Code Examples
+
+### Complete Python online_softmax() Function
+
+Two-pass online softmax that merges max-finding and denominator computation into a single pass, then normalizes in a second pass:
+
+```python
+import math
+
+def online_softmax(x):
+    # Pass 1: Compute max and denominator simultaneously
+    m = float('-inf')
+    d = 0
+    for x_i in x:
+        m_next = max(m, x_i)
+        d = d * math.exp(m - m_next) + math.exp(x_i - m_next)
+        m = m_next
+
+    # Pass 2: Normalize
+    o = []
+    for x_i in x:
+        o.append(math.exp(x_i - m) / d)
+    return o
+```
+
+### PyTorch Implementation with Full Attention Output Loop
+
+Extends online softmax to compute the full attention output `O = softmax(QK^T)V` incrementally, without materializing the attention matrix:
+
+```python
+import torch
+
+torch.manual_seed(1337)
+d_head = 10
+n_ctx = 5
+
+q = torch.randn((d_head,))
+k = torch.randn((n_ctx, d_head))
+v = torch.randn((n_ctx, d_head))
+o = torch.zeros_like(q)
+
+m = torch.tensor(float('-inf'))
+d = torch.tensor(0.0)
+
+for i in range(n_ctx):
+    x_i = q @ k[i:i+1, :].transpose(-2, -1)
+    m_next = torch.maximum(m, x_i)
+    d_next = d * torch.exp(m - m_next) + torch.exp(x_i - m_next)
+
+    o_adjust = d * torch.exp(m - m_next) / d_next
+    o_add = torch.exp(x_i - m_next) * v[i:i+1, :] / d_next
+    o = o * o_adjust + o_add
+    m = m_next
+    d = d_next
+```
+
 ## Key Takeaways
 - Online softmax is the foundational algorithm behind FlashAttention, enabling O(N) memory attention computation
 - The correction factor `exp(m_old - m_new)` is the key mathematical trick that makes incremental softmax possible

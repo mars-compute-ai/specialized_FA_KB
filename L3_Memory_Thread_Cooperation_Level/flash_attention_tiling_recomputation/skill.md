@@ -62,6 +62,36 @@ Backward: Reload Q,K,V blocks; recompute S,P in SRAM using stored (m,l)
 - When custom attention patterns require intermediate matrix access that tiling cannot support
 - Hardware without programmer-managed shared memory (non-GPU accelerators)
 
+## Source Code Examples
+
+### FlashAttention Forward Pass Pseudocode (Tiled Loop with Online Softmax)
+
+```python
+# FlashAttention Forward Pass (simplified)
+for each block Q_i of Q:                    # Outer loop over Q blocks
+    Load Q_i from HBM to SRAM
+    for each block K_j, V_j of K, V:        # Inner loop over K,V blocks
+        Load K_j, V_j from HBM to SRAM
+
+        # All computation happens in SRAM:
+        S_ij = Q_i @ K_j^T                  # Block scores
+
+        # Online softmax update:
+        m_new = max(m_old, rowmax(S_ij))     # Running maximum
+        P_ij = exp(S_ij - m_new)             # Numerically stable exp
+        l_new = exp(m_old - m_new) * l_old + rowsum(P_ij)  # Running sum
+
+        # Accumulate output with rescaling:
+        O_i = diag(exp(m_old - m_new)) * O_i + P_ij @ V_j
+
+        m_old = m_new
+        l_old = l_new
+
+    O_i = diag(1/l_new) * O_i               # Final normalization
+    Write O_i to HBM
+    Store (m, l) for backward pass           # Only store statistics, not N×N matrices
+```
+
 ## Key Takeaways
 - FlashAttention's core insight: **attention is memory-bound, not compute-bound** — reducing HBM traffic matters more than reducing FLOPs
 - Tiling + online softmax enables exact attention without ever materializing N×N matrices in HBM

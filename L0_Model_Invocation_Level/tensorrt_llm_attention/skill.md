@@ -85,6 +85,49 @@ def select_attention_kernel(phase, model_config, hw_config):
             return "paged_kv_attention" # General decode kernel
 ```
 
+## Source Code Examples
+
+### Detailed PluginConfig Setup
+
+```python
+from tensorrt_llm import Builder, BuildConfig
+from tensorrt_llm.plugin import PluginConfig
+
+plugin_config = PluginConfig()
+
+# Core attention plugin
+plugin_config.gpt_attention_plugin = "float16"  # Enable with FP16 compute
+# Options: "float16", "bfloat16", "float32", "disable"
+
+# Paged KV cache
+plugin_config.paged_kv_cache = True       # Enable page-based KV cache (required for production)
+plugin_config.tokens_per_block = 64       # Tokens per KV cache block (default: 64)
+
+# Context (prefill) kernel configuration
+plugin_config.context_fmha_type = "enabled"
+# Options:
+#   "disabled"              - Use unfused attention (slow, for debugging)
+#   "enabled"               - Use FMHA with FP16 accumulation (faster, slightly less precise)
+#   "enabled_with_fp32_acc" - Use FMHA with FP32 accumulation (recommended for training-quality)
+
+# FP8 context attention (Hopper+ only)
+plugin_config.use_fp8_context_fmha = False  # Enable FP8 context attention via cuDNN
+
+# XQA decode kernel
+plugin_config.use_xqa = True                # Enable XQA for GQA/MQA decode (default: True)
+
+# Multi-block mode for long sequences
+plugin_config.multi_block_mode = True       # Enable split-K for decode with long contexts
+
+build_config = BuildConfig(
+    max_batch_size=64,
+    max_input_len=2048,
+    max_seq_len=8192,
+    max_num_tokens=8192,
+    plugin_config=plugin_config,
+)
+```
+
 ## Key Takeaways
 - TRT-LLM uses a multi-kernel strategy: different specialized kernels for context (prefill) vs generation (decode) phases, unlike frameworks that use a single attention implementation
 - The XQA kernel is the key differentiator for GQA/MQA models in decode -- it achieves high memory bandwidth utilization by exploiting the reduced KV head count

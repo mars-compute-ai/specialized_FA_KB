@@ -59,6 +59,75 @@ AMD's Flash Multi-Head Attention (FMHA) implementation in Composable Kernel (CK)
 - Need a high-level attention API (use PyTorch SDPA with CK backend)
 - Working on non-attention workloads (use CK's GEMM or convolution templates)
 
+## Source Code Examples
+
+### sched_group_barrier Examples
+
+AMD's FMHA kernels use `__builtin_amdgcn_sched_group_barrier` to interleave MFMA, TRANS, and VALU instructions for maximum pipeline utilization:
+
+```cpp
+__builtin_amdgcn_sched_group_barrier(0x008, 1, 0); // Allow 1 MFMA
+__builtin_amdgcn_sched_group_barrier(0x200, 2, 0); // Allow 2 TRANS
+__builtin_amdgcn_sched_group_barrier(0x002, 2, 0); // Allow 2 VALU
+```
+
+Phase 0 scheduling pattern (masked attention, Wave Group 0) repeats 8 times:
+```
+Repeat 8 times:
+  1 MFMA instruction
+  2 TRANS instructions
+  2 VALU instructions
+```
+
+Phase 2 scheduling pattern with packed FP32 preamble:
+```
+4 VALU instructions (packed FP32 setup, when enabled)
+Repeat 8 times:
+  1 MFMA instruction
+  4 VALU instructions
+```
+
+### Page Table Lookup Code
+
+Paged KV cache address computation for the Split-KV decode kernel:
+
+```cpp
+index_t page_idx = seq_idx / kPageSize;
+index_t page_offset = seq_idx % kPageSize;
+index_t physical_page = page_table[page_idx];
+address = kv_cache + physical_page * kPageSize * head_dim + page_offset * head_dim;
+```
+
+### FP8 Block Scaling Code
+
+Per-block descale factor lookup during FP8 quantized attention:
+
+```cpp
+const index_t kv_idx = (kv_load_start + i_total_loops * kN0) / block_scale_size_kv;
+float k_descale = k_descale_ptr[kv_idx];
+float v_descale = v_descale_ptr[kv_idx];
+```
+
+OCP vs FNUZ FP8 format shift handling for keeping values in representable range:
+
+```cpp
+#if CK_TILE_USE_OCP_FP8
+    validated_m -= 8.0f;   // OCP shift
+#else
+    validated_m -= 7.0f;   // FNUZ shift
+#endif
+```
+
+Fused dequantization during GEMM accumulation (no separate pass):
+
+```cpp
+// S = Q * K^T: multiply accumulated S by k_descale
+auto s_scaled = s_acc_element_func * k_descale;
+
+// O = P * V: multiply accumulated O by v_descale
+auto o_scaled = o_acc_element * v_descale;
+```
+
 ## Key Takeaways
 - AMD's FMHA kernels use wave-group scheduling with phase-aware barriers to maximize MFMA utilization
 - The transpose load pipeline on GFX950 eliminates separate transpose passes in the backward kernel

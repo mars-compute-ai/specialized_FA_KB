@@ -76,6 +76,50 @@ FFMA R2, R2,   R_frac, R_p0        # t2*f + p0 (on FMA unit)
 - For workloads that do not involve softmax or exponentiation (e.g., pure GEMM)
 - When exact IEEE-754 exponentiation is required for numerical correctness
 
+## Source Code Examples
+
+### Cody-Waite Range Reduction
+
+Decompose `2^x = 2^n * 2^f` where the integer part is computed via bit manipulation (zero cost) and the fractional part is approximated via polynomial:
+
+```
+# Decompose 2^x = 2^n * 2^f
+# n = floor(x)  (integer part)
+# f = x - n     (fractional part, 0 <= f < 1)
+# 2^n is computed via bit manipulation of the IEEE 754 exponent field -- zero cost
+```
+
+### Horner's Polynomial Evaluation (3 FMA Instructions)
+
+Degree-3 polynomial with Sollya-optimized coefficients to approximate `2^f` for `f in [0, 1)`:
+
+```
+2^f ~ p0 + p1*f + p2*f^2 + p3*f^3
+
+Coefficients (Sollya-optimized):
+  p0 = 1.0
+  p1 = 0.69514614
+  p2 = 0.22756439
+  p3 = 0.07711909
+
+Horner's evaluation (3 FMA instructions):
+  t1 = fma(p3, f, p2)     // 0.0771 * f + 0.2276
+  t2 = fma(t1, f, p1)     // t1 * f + 0.6951
+  t3 = fma(t2, f, p0)     // t2 * f + 1.0
+```
+
+### Exponent Reconstruction with Bit Manipulation
+
+Combine the polynomial result (mantissa of `2^f`) with the integer exponent `n` using IEEE 754 bit manipulation instead of a floating-point multiply:
+
+```
+// Instead of: result = ldexp(t3, n)  // floating-point multiply
+// Use: result.exponent_bits += n     // integer addition on exponent field
+
+// This exploits the IEEE 754 floating-point representation directly,
+// avoiding a multiply instruction.
+```
+
 ## Key Takeaways
 - The SFU bottleneck is a **hardware design constraint**, not a software bug -- it will worsen with each GPU generation as tensor cores scale faster
 - Quantitative feeds-and-speeds analysis (cycles per tile per resource) is essential before attempting instruction-level optimization

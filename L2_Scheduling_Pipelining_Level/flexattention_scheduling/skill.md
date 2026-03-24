@@ -73,6 +73,72 @@ thread_block(pair_idx, head_idx, batch_idx):
 - Extremely latency-sensitive paths where JIT compilation overhead is unacceptable (first call compiles)
 - When numerical behavior of score_mod must match a specific reference implementation exactly
 
+## Source Code Examples
+
+### Score Modification Functions
+
+The `score_mod` interface allows defining custom attention patterns as simple Python functions:
+
+**Sliding Window Attention**:
+```python
+def sliding_window(score, b_idx, h_idx, q_idx, kv_idx):
+    return torch.where(
+        torch.abs(q_idx - kv_idx) <= window_size,
+        score,
+        float('-inf')
+    )
+```
+
+**Document Masking** (restrict attention within document boundaries):
+```python
+def document_mask(score, b_idx, h_idx, q_idx, kv_idx):
+    q_doc = q_idx // doc_length
+    kv_doc = kv_idx // doc_length
+    return torch.where(
+        q_doc == kv_doc,
+        score,
+        float('-inf')
+    )
+```
+
+**Soft-capping** (prevent extreme attention scores):
+```python
+def soft_cap(score, b_idx, h_idx, q_idx, kv_idx):
+    cap_value = 30.0
+    return (cap_value / torch.tanh(cap_value)) * torch.tanh(score)
+```
+
+### Compilation with FA4 Backend
+
+```python
+import torch
+from functools import partial
+from torch.nn.attention.flex_attention import flex_attention
+
+# Compile with FA4 backend
+flex_flash = torch.compile(
+    partial(flex_attention, kernel_options={"BACKEND": "FLASH"}),
+    dynamic=False
+)
+
+# Define custom attention variant
+def local_boost(score, b_idx, h_idx, q_idx, kv_idx):
+    """Boost attention scores within local window"""
+    return torch.where(
+        torch.abs(q_idx - kv_idx) <= 8,
+        score * 2,
+        score
+    )
+
+# Execute
+B, H, S, D = 2, 8, 2048, 128
+q = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
+
+out = flex_flash(q, k, v, score_mod=local_boost)
+```
+
 ## Key Takeaways
 - Block-sparse scheduling is the key scheduling innovation: skip entire (q_block, kv_block) pairs that are fully masked, proportionally reducing compute
 - The score_mod interface makes attention pattern customization a Python function rather than a CUDA kernel rewrite

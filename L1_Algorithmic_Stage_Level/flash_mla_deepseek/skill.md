@@ -36,6 +36,29 @@ Multi-Head Latent Attention (MLA) replaces standard MHA/GQA with low-rank factor
 # MLA: cache c_kv (compressed), decompress K,V fused into kernel
 ```
 
+## Code / Pseudo-code
+
+### Python API Usage
+
+```python
+from flash_mla import get_mla_metadata, flash_mla_with_kvcache
+
+# Get tile scheduler metadata
+tile_scheduler_metadata, num_splits = get_mla_metadata(
+    cache_seqlens, s_q * h_q // h_kv, h_kv, h_q, is_fp8, topk
+)
+
+# Run MLA decoding
+for layer in range(num_layers):
+    out, lse = flash_mla_with_kvcache(
+        q, kvcache, block_table, cache_seqlens, dv,
+        tile_scheduler_metadata, num_splits,
+        is_causal, is_fp8_kvcache, indices
+    )
+```
+
+The `indices` parameter is a 3D tensor `(batch_size, seq_len_q, topk)` encoding page block index and token offset for sparse attention. Set invalid entries to -1.
+
 ## Performance
 - **Decode**: 3000 GB/s memory-bound, 660 TFLOPS compute-bound (H800)
 - **Sparse FP8 decode**: 410 TFLOPS (H800), 350 TFLOPS (B200)

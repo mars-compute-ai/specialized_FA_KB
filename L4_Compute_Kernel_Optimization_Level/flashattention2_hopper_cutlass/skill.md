@@ -71,6 +71,29 @@ auto max_quad_1 = ShflReduce<4>::run(max1, maxOp);  // Row 1
 - When using pre-built FlashAttention libraries that already incorporate these optimizations
 - For non-attention GEMM workloads where register pressure from softmax state is not a factor
 
+## Source Code Examples
+
+### TiledMma0 SS Variant Construction (GEMM-I: QK^T)
+
+Both Q and K operands sourced from shared memory. The `ss_op_selector` chooses the shared-shared WGMMA variant:
+
+```cpp
+using TiledMma0 = decltype(cute::make_tiled_mma(
+    cute::GMMA::ss_op_selector<MmaA, MmaB, MmaC, Shape<bM, bN, bK>>(),
+    MmaTileShape{}));
+```
+
+### TiledMma1 RS Variant Construction (GEMM-II: PV)
+
+P (softmax output) sourced from registers, V from shared memory. The `rs_op_selector` chooses the register-shared WGMMA variant with explicit major modes (K-major for P, MN-major for V):
+
+```cpp
+using TiledMma1 = decltype(cute::make_tiled_mma(
+    cute::GMMA::rs_op_selector<MmaA, MmaB, MmaC, Shape<bM, bK, bN>,
+                               GMMA::Major::K, GMMA::Major::MN>(),
+    MmaTileShape{}));
+```
+
 ## Key Takeaways
 - **Tile shape selection for attention is fundamentally different from standalone GEMM**: The fused softmax state (m, l, O accumulator) creates register pressure that does not exist in pure GEMM
 - **64x64 is the safest default** for FlashAttention on Hopper across all head dimensions; 64x128 can be better for small head dimensions

@@ -41,9 +41,9 @@ The result is a lean, high-signal collection where every entry earns its place.
 
 | Metric | Value |
 |--------|-------|
-| Total topics | 67 |
-| Skill cards (`skill.md`) | 67 |
-| Technical documents (`document.md`) | 67 |
+| Total topics | 73 |
+| Skill cards (`skill.md`) | 73 |
+| Technical documents (`document.md`) | 73 |
 | Original research papers (PDF) | 21 |
 | Source code files | 255 |
 | AMD GEAK knowledge files | 14 |
@@ -57,7 +57,7 @@ The result is a lean, high-signal collection where every entry earns its place.
 | **NVIDIA Blackwell** (B200) | SM100, 192GB HBM3e, 8 TB/s | UMMA, TMEM, asymmetric SFU scaling → FA4 |
 | **AMD CDNA2** (MI250X) | gfx90a, 128GB HBM2e, 3.2 TB/s | MFMA (wave-64), LDS 64KB/CU, no TMA equivalent |
 | **AMD CDNA3** (MI300X) | gfx942, 192GB HBM3, 5.3 TB/s | 304 CUs (8 XCDs), FP8 MFMA, chiplet-aware scheduling |
-| **AMD CDNA4** (MI350X) | gfx950, next-gen | New MFMA variants, enhanced memory subsystem |
+| **AMD CDNA4** (MI355X) | gfx950, 288GB HBM3E, 8 TB/s | MXFP8/FP6/FP4 block-scaled MFMA, 160KB LDS, 2× transcendental rate, 10 PF FP4 peak |
 
 ### Attention Variants Covered
 
@@ -132,7 +132,7 @@ Flash Attention's core innovation is fusing tiled GEMM with online softmax. But 
 
 **Why it matters for AI**: When an agent needs to implement a new attention variant, understand why a specific FA version is faster, or decide between softmax attention and linear alternatives, this level provides the algorithmic basis for reasoning about correctness and performance.
 
-#### L2 — Scheduling & Pipelining (13 topics)
+#### L2 — Scheduling & Pipelining (14 topics)
 **Question**: *How should work be distributed and pipelined across the GPU?*
 
 The same algorithm can perform very differently depending on how work is partitioned across thread blocks and how data movement overlaps with computation. This level covers scheduling strategies, profiling methodology, and the producer-consumer pipeline architectures that FA3 and FA4 depend on. Work partitioning and pipelining are tightly coupled — changing one almost always requires changing the other. The level also includes the specific pipeline designs of FA3 (producer-consumer with pingpong) and FA4 (5 specialized warp roles), since these are fundamentally pipeline architecture choices that the AI evaluates before diving into memory or inner-loop details.
@@ -151,11 +151,12 @@ The same algorithm can perform very differently depending on how work is partiti
 | `fa4_warp_roles` | FA4's 5 specialized warps (Load, MMA, Softmax, Correction, Epilogue) |
 | `cutlass_pipelining_warp_spec` | CUTLASS pipeline abstraction: dual barriers, circular buffers, setmaxnreg |
 | `rocm_profiling_attention` | AMD ROCm profiling tools (rocprof, Omniperf, Omnitrace) for attention kernels |
+| `kperfir_compiler_profiling` | KPerfIR (OSDI'25): compiler-centric Triton IR profiling, FA3 24.1% speedup, cross-platform |
 | `split_kv_decode_scheduling` | FlashDecoding split-KV for decode phase, parallel reduction, adaptive num_splits |
 
 **Why it matters for AI**: Scheduling decisions determine GPU occupancy and load balance. Without pipelining, even a mathematically optimal algorithm will leave the GPU idle 50%+ of the time. FA3's warp specialization enabled a 2x improvement over FA2, and FA4's 5-role pipeline is the key architectural innovation for Blackwell. The AI designs the pipeline architecture at this level before implementing memory and inner-loop details.
 
-#### L3 — Memory & Thread Cooperation (11 topics)
+#### L3 — Memory & Thread Cooperation (13 topics)
 **Question**: *Where should each tensor fragment reside, and how should threads cooperate at the hardware level?*
 
 Flash Attention is fundamentally a memory-optimization technique — it exists because naive attention is memory-bound. This level focuses on data placement across the GPU memory hierarchy (HBM → L2 → shared memory → registers), tiling strategies, hardware-specific memory features (TMA deep mechanics, swizzling, bank conflicts), and vendor-specific thread cooperation primitives (AMD wave-64 model). Once the pipeline architecture is designed (L2), this level answers how to implement the data movement that feeds it.
@@ -170,13 +171,15 @@ Flash Attention is fundamentally a memory-optimization technique — it exists b
 | `flash_attention_tile_tuning` | NVIDIA | "Large tile trap" (18-43% regression), fast-math rescue, 918 TFLOPS B200 |
 | `shared_memory_swizzling_bank_conflicts` | All | XOR swizzling, CuTe Swizzle<B,M,S>, bank conflict elimination |
 | `amd_mi300x_flash_attention` | AMD MI300X | CDNA3 chiplet architecture, 5.3 TB/s HBM3, MFMA, num_stages=1 tuning |
+| `amd_cdna_architecture_guide` | AMD MI300X/MI355X | CDNA3/CDNA4 chiplet architecture, CU microarchitecture, cache hierarchy, HBM specs |
+| `mi300_compute_memory_partitioning` | AMD MI300X/MI355X | SPX/CPX/DPX/QPX compute modes, NPS1/NPS4 memory modes, 5-15% bandwidth improvement |
 | `amd_wavefront_cooperation` | AMD MI250X/MI300X | Wave-64 model, MFMA scheduling, buffer-to-LDS transfers, butterfly reductions |
 | `blackwell_tmem` | NVIDIA Blackwell | Tensor Memory (TMEM): 128x256x32-bit buffer, TMEM allocation, FA4 usage |
 | `thread_block_clusters` | NVIDIA Hopper/Blackwell | Cluster launch, distributed shared memory (DSMEM), TMA multicast for KV |
 
 **Why it matters for AI**: The single biggest performance variable in attention is how data moves through the memory hierarchy. Getting tiling, swizzling, or TMA usage wrong can cost 2-10x performance.
 
-#### L4 — Compute Kernel Optimization (12 topics)
+#### L4 — Compute Kernel Optimization (14 topics)
 **Question**: *How to optimize the innermost compute loop — tensor core config, softmax, and instruction scheduling?*
 
 The innermost loop of Flash Attention executes matrix multiply-accumulate instructions (WGMMA on NVIDIA, MFMA on AMD) interleaved with softmax reductions. This level combines three aspects of inner-loop optimization that are tuned together in practice: (1) MMA tile shapes and instruction selection, (2) softmax implementation and approximation, and (3) instruction-level scheduling and PTX tuning. A tile shape change affects softmax register pressure which affects instruction overlap — they cannot be optimized independently.
@@ -186,6 +189,8 @@ The innermost loop of Flash Attention executes matrix multiply-accumulate instru
 | `wgmma_hopper_tutorial` | NVIDIA Hopper | WGMMA m64nNk16, SS vs RS variants, descriptor-based SMEM, swizzle modes |
 | `flashattention2_hopper_cutlass` | NVIDIA Hopper | FA2 microkernel: tile shape crisis (128×128 collapses at d=256), SS/RS selection |
 | `amd_fmha_kernel_internals` | AMD MI300X/MI350X | FMHA V3 fwd/bwd/splitkv/FP8/prefill kernels, wave-group scheduling, MFMA pipeline |
+| `amd_mfma_matrix_core_programming` | AMD MI300X/MI355X | MFMA intrinsics, tile shapes, data layouts, FP32/FP16/FP8/FP4 examples, block scaling |
+| `amd_gfx9_kernel_optimization` | AMD MI300X/MI355X | GFX9 register usage, LDS bank conflicts, global memory patterns, cross-lane primitives |
 | `online_softmax_algorithm` | All | Running max/sum recurrence for tiled softmax, practical kernel implementation |
 | `fa4_official_paper` | NVIDIA Blackwell | FA4 polynomial exp (degree-3, 8.77e-5 error), conditional rescaling (τ=8.0), 1613 TFLOPs/s |
 | `fast_math_softmax` | NVIDIA | flush_to_zero + approx rounding: 34-72% speedup, SASS instruction comparison |
@@ -198,7 +203,7 @@ The innermost loop of Flash Attention executes matrix multiply-accumulate instru
 
 **Why it matters for AI**: A bad tile shape choice can cause register spills that destroy performance (128×128 drops from 308 to 36.7 TFLOPs). Softmax is where FA3→FA4's biggest algorithmic innovations happen (polynomial exp, conditional rescaling). The SFU bottleneck analysis shows that on Blackwell, the exponential function unit is 512x slower than tensor cores — understanding this asymmetry drove FA4's entire design.
 
-#### L5 — Numerical Precision (7 topics)
+#### L5 — Numerical Precision (8 topics)
 **Question**: *What precision should the kernel use, and how to maintain accuracy?*
 
 FP8 attention can deliver 2x the throughput of FP16, but naive quantization destroys accuracy. This level covers precision formats from FP16 down to FP4, quantization strategies (block quantization, Hadamard incoherent processing, microscaling), and mixed-precision techniques that make low-precision attention viable. Blackwell's FP4 tensor cores and OCP microscaling formats represent the next frontier.
@@ -211,6 +216,7 @@ FP8 attention can deliver 2x the throughput of FP16, but naive quantization dest
 | `pytorch_sdpa_precision` | Backend precision differences, float32 upcast in math backend, reproducibility |
 | `sageattention2_mixed_precision` | INT4 Q/K + FP8 P/V, outlier smoothing, 3-5x over FA2 with better accuracy |
 | `mxfp_microscaling_formats` | OCP MX standard (shared exponent per block of 32), MXFP4/MXFP8, Blackwell native support |
+| `amd_cdna_low_precision_types` | AMD FP4/FP6/FP8 formats, OCP MXFP block scaling, E8M0 scale factors, CDNA3/CDNA4 support |
 | `blackwell_fp4_attention` | FP4 (E2M1) tensor cores on B200, 2x FP8 throughput, sub-byte quantization for attention |
 
 **Why it matters for AI**: Precision is the highest-leverage performance knob — going from FP16 to FP8 can double throughput. But getting the quantization strategy wrong can silently corrupt model outputs. This level provides the trade-off analysis.
@@ -262,7 +268,7 @@ topic_name/
 
 | Target GPU | Key entries |
 |---|---|
-| **AMD MI250X / MI300X** | L0/amd_composable_kernel, L3/amd_mi300x_flash_attention, L3/amd_wavefront_cooperation, L4/amd_fmha_kernel_internals |
+| **AMD MI250X / MI300X / MI355X** | L0/amd_composable_kernel, L3/amd_cdna_architecture_guide, L3/amd_mi300x_flash_attention, L3/mi300_compute_memory_partitioning, L3/amd_wavefront_cooperation, L4/amd_fmha_kernel_internals, L4/amd_mfma_matrix_core_programming, L4/amd_gfx9_kernel_optimization, L5/amd_cdna_low_precision_types |
 | **NVIDIA Ampere (A100)** | L1/flash_attention_2, L2/fa2_scheduling, L4/flashattention2_hopper_cutlass |
 | **NVIDIA Hopper (H100)** | L1/flash_attention_3, L2/flashattention3_pipelining, L2/fa3_warp_specialization, L4/wgmma_hopper_tutorial |
 | **NVIDIA Blackwell (B200)** | L1/flash_attention_4, L2/fa4_warp_roles, L4/fa4_official_paper, L4/sfu_bottleneck_asymmetric_scaling |
@@ -283,7 +289,7 @@ topic_name/
 
 - **New to Flash Attention?** Start with L1/original_flash_attention and L1/online_softmax_to_flash_attention for the mathematical foundations, then L0/flash_attention_free_lunch for the practical integration guide.
 - **Kernel engineer?** Go directly to the level matching your current bottleneck (L2-L4 are the core kernel engineering levels).
-- **Porting NVIDIA→AMD?** Read L0/amd_composable_kernel for framework differences, L3/amd_mi300x_flash_attention for architecture differences, L3/amd_wavefront_cooperation for wave-64 vs warp-32, and L4/amd_fmha_kernel_internals for AMD kernel implementation details.
+- **Porting NVIDIA→AMD?** Read L0/amd_composable_kernel for framework differences, L3/amd_cdna_architecture_guide for hardware architecture, L3/amd_mi300x_flash_attention for FA-specific tuning, L3/mi300_compute_memory_partitioning for deployment modes, L3/amd_wavefront_cooperation for wave-64 vs warp-32, L4/amd_mfma_matrix_core_programming for MFMA instructions (vs WGMMA), L4/amd_gfx9_kernel_optimization for low-level optimization, L4/amd_fmha_kernel_internals for kernel implementation details, and L5/amd_cdna_low_precision_types for AMD precision formats.
 - **Exploring AI-driven optimization?** Start with L0/ai_driven_kernel_optimization for the landscape, then L0/thunderkittens for tile abstractions.
 
 ---
@@ -358,7 +364,7 @@ knowledge_base/
 │   ├── paged_attention/                             — KV cache as virtual memory pages (vLLM)
 │   └── linear_attention_mamba2/                     — SSM-attention duality, Mamba-2
 │
-├── L2_Scheduling_Pipelining_Level/                  (13 topics)
+├── L2_Scheduling_Pipelining_Level/                  (14 topics)
 │   ├── fa2_scheduling/                              — Sliced-Q/K partitioning, seq-length parallelism
 │   ├── flexattention_scheduling/                    — Block-sparse iteration, masked region skipping
 │   ├── nsight_profiling_flash_attention/            — Profiler-driven optimization methodology
@@ -371,9 +377,10 @@ knowledge_base/
 │   ├── fa4_warp_roles/                              — FA4 5 specialized warps
 │   ├── cutlass_pipelining_warp_spec/                — CUTLASS dual barriers, circular buffers
 │   ├── rocm_profiling_attention/                    — AMD ROCm profiling (rocprof, Omniperf)
+│   ├── kperfir_compiler_profiling/                  — KPerfIR compiler-centric Triton IR profiling (OSDI'25)
 │   └── split_kv_decode_scheduling/                  — FlashDecoding split-KV, parallel reduction
 │
-├── L3_Memory_Thread_Cooperation_Level/              (11 topics)
+├── L3_Memory_Thread_Cooperation_Level/              (13 topics)
 │   ├── gpu_memory_hierarchy/                        — Register→L1→L2→HBM latencies/bandwidths
 │   ├── flash_attention_tiling_recomputation/        — O(N²)→O(N) tiling, backward recomputation
 │   ├── why_flash_attention_memory_bound/            — Roofline analysis, 97% N×N traffic
@@ -382,14 +389,18 @@ knowledge_base/
 │   ├── flash_attention_tile_tuning/                 — "Large tile trap", fast-math rescue
 │   ├── shared_memory_swizzling_bank_conflicts/      — XOR swizzling, bank conflict elimination
 │   ├── amd_mi300x_flash_attention/                  — CDNA3 chiplet, 5.3 TB/s HBM3, MFMA
+│   ├── amd_cdna_architecture_guide/                 — CDNA3/CDNA4 chiplet arch, CU, cache, HBM specs
+│   ├── mi300_compute_memory_partitioning/           — MI300 SPX/CPX modes, NPS1/NPS4, deployment
 │   ├── amd_wavefront_cooperation/                   — Wave-64 model, MFMA, butterfly reductions
 │   ├── blackwell_tmem/                              — Tensor Memory (TMEM), 128x256x32-bit
 │   └── thread_block_clusters/                       — Cluster launch, DSMEM, TMA multicast
 │
-├── L4_Compute_Kernel_Optimization_Level/            (12 topics)
+├── L4_Compute_Kernel_Optimization_Level/            (14 topics)
 │   ├── wgmma_hopper_tutorial/                       — WGMMA m64nNk16, SS/RS variants
 │   ├── flashattention2_hopper_cutlass/              — FA2 tile shape crisis at d=256
 │   ├── amd_fmha_kernel_internals/                   — FMHA V3 fwd/bwd/splitkv/FP8/prefill
+│   ├── amd_mfma_matrix_core_programming/            — MFMA intrinsics, tile shapes, FP8/FP4 examples
+│   ├── amd_gfx9_kernel_optimization/                — Register usage, LDS, global mem, cross-lane ops
 │   ├── online_softmax_algorithm/                    — Running max/sum recurrence
 │   ├── fa4_official_paper/                          — Polynomial exp, conditional rescaling
 │   ├── fast_math_softmax/                           — flush_to_zero, 34-72% speedup
@@ -400,13 +411,14 @@ knowledge_base/
 │   ├── sfu_bottleneck_asymmetric_scaling/           — 512:1 tensor core vs SFU imbalance
 │   └── umma_blackwell/                              — UMMA on SM100, TMEM operands, CTA-group
 │
-├── L5_Numerical_Precision_Level/                    (7 topics)
+├── L5_Numerical_Precision_Level/                    (8 topics)
 │   ├── fa3_fp8_fp16/                                — Block quantization, Hadamard processing
 │   ├── nvidia_fp8_formats/                          — E4M3/E5M2, MXFP8, Transformer Engine
 │   ├── quip_incoherent_processing/                  — Randomized Hadamard, 2.6x error reduction
 │   ├── pytorch_sdpa_precision/                      — Backend precision, float32 upcast
 │   ├── sageattention2_mixed_precision/              — INT4 Q/K + FP8 P/V, 3-5x over FA2
 │   ├── mxfp_microscaling_formats/                   — OCP MX standard, MXFP4/MXFP8, Blackwell
+│   ├── amd_cdna_low_precision_types/                — AMD FP4/FP6/FP8, MXFP block scaling, CDNA3/4
 │   └── blackwell_fp4_attention/                     — FP4 (E2M1) tensor cores, 2x FP8 throughput
 │
 └── README.md                                        (this file)

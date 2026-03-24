@@ -89,6 +89,86 @@ graph.build_plans()
 graph.execute({q: q_gpu, k: k_gpu, v: v_gpu, o: o_gpu, stats: stats_gpu}, workspace)
 ```
 
+## Source Code Examples
+
+### FP8 Attention (cuDNN 9.x, Hopper+)
+
+```python
+# FP8 E4M3 attention for 2x compute throughput
+graph = cudnn.pygraph(
+    io_data_type=cudnn.data_type.FP8_E4M3,
+    intermediate_data_type=cudnn.data_type.FLOAT,
+    compute_data_type=cudnn.data_type.FLOAT,
+)
+
+q_fp8 = graph.tensor(
+    name="Q",
+    dim=[B, H, S_q, D],
+    stride=[H * S_q * D, S_q * D, D, 1],
+    data_type=cudnn.data_type.FP8_E4M3,
+)
+k_fp8 = graph.tensor(
+    name="K",
+    dim=[B, H, S_kv, D],
+    stride=[H * S_kv * D, S_kv * D, D, 1],
+    data_type=cudnn.data_type.FP8_E4M3,
+)
+v_fp8 = graph.tensor(
+    name="V",
+    dim=[B, H, S_kv, D],
+    stride=[H * S_kv * D, S_kv * D, D, 1],
+    data_type=cudnn.data_type.FP8_E4M3,
+)
+
+# Scaling tensors for FP8 (per-tensor or per-head scaling)
+descale_q = graph.tensor(name="descale_Q", dim=[1,1,1,1], stride=[1,1,1,1],
+                          data_type=cudnn.data_type.FLOAT)
+descale_k = graph.tensor(name="descale_K", dim=[1,1,1,1], stride=[1,1,1,1],
+                          data_type=cudnn.data_type.FLOAT)
+descale_v = graph.tensor(name="descale_V", dim=[1,1,1,1], stride=[1,1,1,1],
+                          data_type=cudnn.data_type.FLOAT)
+descale_s = graph.tensor(name="descale_S", dim=[1,1,1,1], stride=[1,1,1,1],
+                          data_type=cudnn.data_type.FLOAT)
+scale_s = graph.tensor(name="scale_S", dim=[1,1,1,1], stride=[1,1,1,1],
+                        data_type=cudnn.data_type.FLOAT)
+scale_o = graph.tensor(name="scale_O", dim=[1,1,1,1], stride=[1,1,1,1],
+                        data_type=cudnn.data_type.FLOAT)
+
+o, stats, amax_s, amax_o = graph.sdpa_fp8(
+    name="sdpa_fp8",
+    q=q_fp8, k=k_fp8, v=v_fp8,
+    descale_q=descale_q, descale_k=descale_k,
+    descale_v=descale_v, descale_s=descale_s,
+    scale_s=scale_s, scale_o=scale_o,
+    is_inference=True,
+    attn_scale=1.0 / (D ** 0.5),
+    use_causal_mask=True,
+)
+```
+
+### GQA / MQA Support
+
+```python
+# GQA: 32 query heads, 8 KV heads (4:1 ratio)
+H_q, H_kv = 32, 8
+
+q = graph.tensor(name="Q", dim=[B, H_q, S_q, D],
+                  stride=[H_q * S_q * D, S_q * D, D, 1])
+# K and V use H_kv heads, cuDNN broadcasts automatically
+k = graph.tensor(name="K", dim=[B, H_kv, S_kv, D],
+                  stride=[H_kv * S_kv * D, S_kv * D, D, 1])
+v = graph.tensor(name="V", dim=[B, H_kv, S_kv, D],
+                  stride=[H_kv * S_kv * D, S_kv * D, D, 1])
+
+# cuDNN handles the Q-head to KV-head mapping internally
+o, stats = graph.sdpa(
+    name="sdpa_gqa",
+    q=q, k=k, v=v,
+    is_inference=True,
+    attn_scale=1.0 / (D ** 0.5),
+)
+```
+
 ## Key Takeaways
 - cuDNN Fused Attention is NVIDIA's first-party optimized SDPA, providing strong baseline performance and production stability across Ampere, Hopper, and Blackwell GPUs
 - It is accessible as a PyTorch SDPA backend (`SDPBackend.CUDNN_ATTENTION`) for zero-effort integration, or via the `cudnn-frontend` graph API for advanced customization

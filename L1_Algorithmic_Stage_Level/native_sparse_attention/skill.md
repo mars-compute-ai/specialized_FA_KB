@@ -80,6 +80,82 @@ O[t] = g_local * O_local + g_compress * O_compress + g_select * O_select
 - Models that have already been pretrained with dense attention and cannot be retrained (NSA requires training with the sparse pattern to learn effective selection)
 - When using hardware without efficient block-sparse primitives (e.g., older GPUs without good Tensor Core utilization for variable block sizes)
 
+## Code / Pseudo-code
+
+### Python: NSAAttention Module (Drop-in Replacement)
+
+```python
+class NSAAttention(nn.Module):
+    def __init__(self, d_model, n_heads, window=512, compress_ratio=64,
+                 block_size=64, top_k=16):
+        super().__init__()
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.compress_k = nn.Linear(compress_ratio * (d_model // n_heads),
+                                     d_model // n_heads)
+        self.compress_v = nn.Linear(compress_ratio * (d_model // n_heads),
+                                     d_model // n_heads)
+        self.gate_proj = nn.Linear(d_model // n_heads, 3)
+
+    def forward(self, x):
+        Q, K, V = self.qkv_proj(x).chunk(3, dim=-1)
+        # ... three-branch computation as described above ...
+        return nsa_attention(Q, K, V, self.compress_k, self.compress_v,
+                             self.gate_proj, self.config)
+```
+
+### C++/CUDA: Fused Three-Branch Kernel Stub
+
+```cpp
+__global__ void nsa_fused_kernel(
+    const half* Q, const half* K, const half* V,
+    const half* K_compressed, const half* V_compressed,
+    const int* block_indices,  // top-k selected block IDs
+    const float* gates,        // per-head gate values
+    half* O,                   // output
+    int N, int d, int w, int l, int b, int k
+) {
+    // Each thread block handles one query position and one head
+    int t = blockIdx.x;  // query position
+    int h = blockIdx.y;  // head index
+
+    // Shared memory for Q tile, partial outputs, softmax stats
+    __shared__ half Q_tile[d];
+    __shared__ float m_local, m_compress, m_select;
+    __shared__ float d_local, d_compress, d_select;
+    __shared__ float O_local[d], O_compress[d], O_select[d];
+
+    // Load Q[t] into shared memory (once, used by all branches)
+    load_q_tile(Q, t, h, Q_tile);
+
+    // Branch 1: Local attention (FlashAttention over window)
+    flash_attention_window(Q_tile, K, V, t, h, w, d,
+                           &m_local, &d_local, O_local);
+
+    // Branch 2: Compressed attention
+    flash_attention_compressed(Q_tile, K_compressed, V_compressed,
+                               t, h, l, d,
+                               &m_compress, &d_compress, O_compress);
+
+    // Branch 3: Selected block attention
+    flash_attention_selected(Q_tile, K, V, block_indices,
+                             t, h, b, k, d,
+                             &m_select, &d_select, O_select);
+
+    // Gated combination
+    float g0 = gates[h * 3 + 0];
+    float g1 = gates[h * 3 + 1];
+    float g2 = gates[h * 3 + 2];
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        O[t * H * d + h * d + i] = __float2half(
+            g0 * O_local[i] / d_local +
+            g1 * O_compress[i] / d_compress +
+            g2 * O_select[i] / d_select
+        );
+    }
+}
+```
+
 ## Key Takeaways
 - NSA achieves comparable perplexity to dense attention on pretraining benchmarks while reducing attention FLOPs by 6-10x on long sequences (64K tokens)
 - The three-branch design is not arbitrary: local captures recency, compressed captures global summary, and selected captures specific long-range dependencies -- together they cover the attention patterns empirically observed in trained dense models

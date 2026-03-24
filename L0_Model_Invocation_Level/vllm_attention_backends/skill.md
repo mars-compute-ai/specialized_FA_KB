@@ -83,6 +83,28 @@ llm = LLM(
 # 5. Validate backend supports required features
 ```
 
+## Source Code Examples
+
+### Block Table and KV Cache Structure (PagedAttention)
+
+```python
+# Block table: maps logical block indices to physical block indices
+# Shape: [max_num_seqs, max_num_blocks_per_seq]
+block_table = torch.tensor([
+    [3, 7, 12, 0, 0],   # Request 0: blocks 3, 7, 12 (padded with 0s)
+    [1, 5, 9, 15, 0],   # Request 1: blocks 1, 5, 9, 15
+    [2, 8, 0, 0, 0],    # Request 2: blocks 2, 8
+], dtype=torch.int32, device="cuda")
+
+# KV cache: physical blocks stored contiguously
+# Shape: [num_blocks, 2, num_heads, block_size, head_dim]
+# 2 = K and V stored together
+kv_cache = torch.empty(
+    num_blocks, 2, num_kv_heads, block_size, head_dim,
+    dtype=torch.float16, device="cuda"
+)
+```
+
 ## Key Takeaways
 - vLLM's attention backend choice has a significant impact on serving throughput and latency -- always benchmark for your specific model and hardware
 - FlashAttention-2 is the safe default on NVIDIA GPUs; FlashInfer can provide 10-30% higher decode throughput for GQA models at high batch sizes

@@ -133,6 +133,56 @@ desc_mxfp8 = make_instr_desc(
 - When attention head dimension is very small (d=32 or 64), where the block size of 32 may not align well with the tensor dimensions
 - During early model development where numerical debugging requires full-precision introspection
 
+## Source Code Examples
+
+### Hopper Software MX Implementation (FlashAttention-3)
+
+On Hopper (H100), MX block scaling is not hardware-native. FlashAttention-3 implements block quantization in software before WGMMA, with power-of-2 rounding to satisfy the E8M0 constraint:
+
+```python
+# FlashAttention-3 approach: block quantization before WGMMA
+def prepare_fp8_blocks(tensor, block_size=32):
+    flat = tensor.reshape(-1, block_size)
+    amax = flat.abs().amax(dim=-1, keepdim=True)
+    # Round to power of 2 (E8M0 constraint)
+    scale = torch.pow(2, torch.floor(torch.log2(amax.clamp(min=1e-38))))
+    quantized = (flat / scale).to(torch.float8_e4m3fn)
+    # Scale factors applied during accumulation (not native)
+    return quantized, scale
+
+# The WGMMA instruction on Hopper does NOT have max_shift
+# Dequantization must happen in software between GEMM tiles
+```
+
+### AMD Composable Kernel Block-Scale Implementation (CDNA)
+
+AMD's Composable Kernel implements FP8 block scaling on CDNA architectures with configurable block sizes (not fixed at 32). The per-block descale is applied in software during GEMM accumulation:
+
+```cpp
+// From CK fmha_fwd kernel (gfx9)
+// Block scale is applied during GEMM accumulation
+struct FmhaFwdCommonBlockScaleKargs {
+    index_t nhead_stride_q_descale;
+    index_t nhead_stride_k_descale;
+    index_t nhead_stride_v_descale;
+    index_t block_scale_size_q;    // Configurable (not fixed at 32)
+    index_t block_scale_size_kv;
+};
+
+// Apply descale during score accumulation
+float k_descale = k_descale_ptr[kv_idx];
+auto s_acc = s_acc_raw * k_descale;
+
+// FP8 shift for softmax numerical stability
+#if CK_TILE_USE_OCP_FP8
+    validated_m -= 8.0f;   // OCP FP8 shift
+#else
+    validated_m -= 7.0f;   // FNUZ FP8 shift
+#endif
+```
+
+Key difference from Blackwell: AMD's block size is configurable (not fixed at 32), and dequantization happens in software during the GEMM accumulation phase rather than natively in the tensor core.
+
 ## Key Takeaways
 - MX formats fix the block size at 32 elements with E8M0 (power-of-2) scales -- this is an OCP industry standard, not an NVIDIA-specific choice
 - The E8M0 scale factor has no mantissa bits, so it can only represent exact powers of 2. This constraint enables efficient hardware implementation via exponent addition.

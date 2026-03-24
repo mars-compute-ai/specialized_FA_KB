@@ -131,27 +131,7 @@ result = batch_decode_with_kv_cache(
 
 # === CUDA FP4 Vector Operations (from FlashInfer vec_dtypes.cuh) ===
 # FP4 values are sub-byte; two elements pack into one uint8
-"""
-// vec_t<__nv_fp4_e2m1, 2>: two FP4 values in one byte
-struct vec_t<__nv_fp4_e2m1, 2> {
-    uint8_t data;  // Lower 4 bits = element 0, upper 4 bits = element 1
-    void fill(__nv_fp4_e2m1 val) {
-        data = (__nv_fp4x2_storage_t(val.__x) << 4) |
-               __nv_fp4x2_storage_t(val.__x);
-    }
-    void load(const __nv_fp4_e2m1* ptr) { data = *((uint8_t*)ptr); }
-    void store(__nv_fp4_e2m1* ptr) const { *((uint8_t*)ptr) = data; }
-};
-
-// vec_t<__nv_fp4_e2m1, 8>: eight FP4 values in one uint32
-struct vec_t<__nv_fp4_e2m1, 8> {
-    uint32_t data;
-    // ... pack/unpack via bit operations
-};
-
-// vec_t<__nv_fp4_e2m1, 32+>: use int4 (128-bit) for bulk operations
-// This aligns with MX block size of 32
-"""
+# (See "Source Code Examples" section below for full implementations)
 
 
 # === UMMA Descriptor for FP4 Attention ===
@@ -171,6 +151,75 @@ desc_fp4 = make_instr_desc(
 )
 # Note: Most practical FP4 attention uses FP8 for QK^T and FP4 for KV cache/output
 ```
+
+## Source Code Examples
+
+### FP4 Sub-Byte Packing: vec_t<\_\_nv\_fp4\_e2m1, 2> (FlashInfer vec_dtypes.cuh)
+
+Two FP4 values packed into one uint8, with fill/load/store methods:
+
+```cpp
+// Two FP4 values packed into one uint8
+template <>
+struct vec_t<__nv_fp4_e2m1, 2> {
+    uint8_t data;  // Lower 4 bits = element 0, upper 4 bits = element 1
+
+    void fill(__nv_fp4_e2m1 val) {
+        // Pack same value into both nibbles
+        data = (__nv_fp4x2_storage_t(val.__x) << 4) |
+               __nv_fp4x2_storage_t(val.__x);
+    }
+
+    void load(const __nv_fp4_e2m1* ptr) { data = *((uint8_t*)ptr); }
+    void store(__nv_fp4_e2m1* ptr) const { *((uint8_t*)ptr) = data; }
+};
+```
+
+### Progressively Larger FP4 Vector Types (FlashInfer vec_dtypes.cuh)
+
+Larger vector types use wider integer storage, up to 128-bit int4 for MX-block-aligned bulk operations:
+
+```cpp
+// 4 FP4 values in uint16
+template <> struct vec_t<__nv_fp4_e2m1, 4> { uint16_t data; };
+
+// 8 FP4 values in uint32
+template <> struct vec_t<__nv_fp4_e2m1, 8> { uint32_t data; };
+
+// 16 FP4 values in uint2 (64 bits)
+template <> struct vec_t<__nv_fp4_e2m1, 16> { uint2 data; };
+
+// 32+ FP4 values in int4 arrays (128-bit loads)
+template <size_t vec_size>
+struct vec_t<__nv_fp4_e2m1, vec_size> {
+    static_assert(vec_size % 32 == 0);
+    int4 data[vec_size / 32];  // One int4 per 32 elements = one MX block
+};
+```
+
+### FP4 Bulk Memory Operations (FlashInfer vec_dtypes.cuh)
+
+128-bit (int4) load/store for 32+ FP4 elements, with global memory release semantics:
+
+```cpp
+// Bulk load/store using 128-bit (int4) operations for 32+ elements
+void load(const __nv_fp4_e2m1* ptr) {
+    #pragma unroll
+    for (size_t i = 0; i < vec_size / 32; ++i) {
+        data[i] = ((int4*)ptr)[i];  // 128-bit load
+    }
+}
+
+// Global memory operations with memory ordering
+void store_global_release(__nv_fp4_e2m1* addr) const {
+    #pragma unroll
+    for (size_t i = 0; i < vec_size / 32; ++i) {
+        st_global_release(*(int4*)&data[i], (int4*)(addr + i * 16));
+    }
+}
+```
+
+Note: 32 FP4 values = 16 bytes = 128 bits (one int4), so the MX block size of 32 aligns perfectly with 128-bit memory operations. This alignment is by design in the OCP MX specification.
 
 ## When to Use
 - On Blackwell GPUs for inference-time decode attention where memory bandwidth is the primary bottleneck and FP4 KV cache provides 4x compression

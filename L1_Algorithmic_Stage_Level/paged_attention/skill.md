@@ -105,6 +105,111 @@ def write_kv(seq_id, block_idx, new_k, new_v):
 - When using models that don't use KV cache (e.g., encoder-only models like BERT, or SSM-based models like Mamba)
 - Latency-critical single-sequence inference where the indirection overhead of page table lookups may add measurable latency
 
+## Code / Pseudo-code
+
+### Python: Block Allocator for Page Management
+
+```python
+class BlockAllocator:
+    def __init__(self, num_blocks, block_size):
+        self.free_blocks = deque(range(num_blocks))
+        self.ref_counts = [0] * num_blocks
+
+    def allocate(self):
+        block_id = self.free_blocks.popleft()
+        self.ref_counts[block_id] = 1
+        return block_id
+
+    def free(self, block_id):
+        self.ref_counts[block_id] -= 1
+        if self.ref_counts[block_id] == 0:
+            self.free_blocks.append(block_id)
+
+    def share(self, block_id):
+        self.ref_counts[block_id] += 1
+```
+
+### CUDA: PagedAttention v2 Kernel (Split-K)
+
+```cuda
+// PagedAttention v2 kernel (simplified)
+// Each warp group handles one query head attending to all KV blocks
+
+template <int HEAD_DIM, int BLOCK_SIZE, int NUM_WARPS>
+__global__ void paged_attention_kernel(
+    const half* __restrict__ q,           // [batch, heads, d]
+    const half* __restrict__ kv_pool,     // [num_blocks, 2, block_size, d]
+    const int*  __restrict__ page_tables, // [batch, max_pages]
+    const int*  __restrict__ seq_lens,    // [batch]
+    half*       __restrict__ output,      // [batch, heads, d]
+    float*      __restrict__ exp_sums,    // [batch, heads, max_partitions]
+    float*      __restrict__ max_logits   // [batch, heads, max_partitions]
+) {
+    const int seq_id = blockIdx.x;
+    const int head_id = blockIdx.y;
+    const int partition_id = blockIdx.z;  // for split-k parallelism
+    const int seq_len = seq_lens[seq_id];
+
+    // Load query into shared memory (once per block)
+    __shared__ half q_smem[HEAD_DIM];
+    load_query(q, seq_id, head_id, q_smem);
+
+    // Online softmax accumulators (per thread)
+    float m = -INFINITY;  // running max
+    float d = 0.0f;       // running denominator
+    float o[HEAD_DIM / WARP_SIZE] = {0};  // partial output (distributed)
+
+    // Iterate over KV blocks assigned to this partition
+    int start_block = partition_id * blocks_per_partition;
+    int end_block = min(start_block + blocks_per_partition, num_blocks);
+
+    for (int block_idx = start_block; block_idx < end_block; block_idx++) {
+        // PAGE TABLE LOOKUP
+        int phys_block = page_tables[seq_id * max_pages + block_idx];
+
+        // Load K block from physical address (coalesced within block)
+        half k_tile[BLOCK_SIZE][HEAD_DIM];  // in registers/shared mem
+        load_kv_block(kv_pool, phys_block, /*is_key=*/true, k_tile);
+
+        // Compute QK^T for this block
+        float scores[BLOCK_SIZE];
+        for (int t = 0; t < BLOCK_SIZE; t++) {
+            scores[t] = dot_product(q_smem, k_tile[t]) * rsqrt_d;
+        }
+
+        // Mask padding tokens in last block
+        int valid = min(BLOCK_SIZE, seq_len - block_idx * BLOCK_SIZE);
+        for (int t = valid; t < BLOCK_SIZE; t++) {
+            scores[t] = -INFINITY;
+        }
+
+        // Online softmax update
+        float m_local = max_of(scores, BLOCK_SIZE);
+        float m_new = fmaxf(m, m_local);
+        float correction = expf(m - m_new);
+
+        // Load V block and accumulate
+        half v_tile[BLOCK_SIZE][HEAD_DIM];
+        load_kv_block(kv_pool, phys_block, /*is_key=*/false, v_tile);
+
+        d = d * correction;
+        for (int t = 0; t < BLOCK_SIZE; t++) {
+            float p = expf(scores[t] - m_new);
+            d += p;
+            for (int i = 0; i < HEAD_DIM / WARP_SIZE; i++) {
+                o[i] = o[i] * correction + p * __half2float(v_tile[t][...]);
+            }
+        }
+        m = m_new;
+    }
+
+    // Write partition results (to be reduced across partitions)
+    exp_sums[seq_id * heads * partitions + head_id * partitions + partition_id] = d;
+    max_logits[...] = m;
+    write_partial_output(output, o, d);
+}
+```
+
 ## Key Takeaways
 - PagedAttention reduces KV cache memory waste from 60-80% (naive pre-allocation) to < 4% (only last-page internal fragmentation), enabling 2-4x more concurrent sequences and proportional throughput gains
 - The vLLM system built on PagedAttention achieves 2-4x higher serving throughput than HuggingFace Transformers and 2.2x higher than FasterTransformer on real LLM serving workloads (OPT-13B, LLaMA-13B)

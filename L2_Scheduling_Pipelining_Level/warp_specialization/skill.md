@@ -65,6 +65,34 @@ THREAD_BLOCK:
 - When compiler-based pipelining (e.g., Triton) can automatically achieve the needed overlap
 - Prototyping phase where development velocity matters more than peak performance
 
+## Source Code Examples
+
+### Warp Specialization Loop with Wait/Signal Pattern
+
+The canonical producer-consumer structure with explicit synchronization:
+
+```cpp
+if (warpid() == LOAD) {
+    for (int i = 0; i < num_tiles; i++) {
+        if (i > 0) {
+            wait_for_tile_release();      // Consumer done with previous buffer
+        }
+        async_tma_load(tile);             // Issue TMA load to SMEM
+        wait_for_tma_load();              // Wait for TMA completion
+        signal_tile_loaded();             // Notify consumer: data ready
+    }
+} else {  // COMPUTE warps
+    for (int i = 0; i < num_tiles; i++) {
+        wait_for_tile_loaded();           // Wait for producer signal
+        async_mma(tile_data);             // Tensor core WGMMA
+        wait_for_async_mma();             // Wait for MMA completion
+        signal_tile_released();           // Notify producer: buffer free
+    }
+}
+```
+
+The key insight is that while the compute warp blocks on `wait_for_tile_loaded()`, the producer warp can proceed with loading the next tile, and vice versa. The GPU warp scheduler dynamically interleaves these specialized warps to absorb variable memory latency.
+
 ## Key Takeaways
 - Warp specialization is a design trade-off, not a universal requirement—it trades programmer complexity for hiding variable-latency operations
 - Three conditions justify specialization: resource exhaustion, variable-latency scheduling, and blocking synchronization placement
